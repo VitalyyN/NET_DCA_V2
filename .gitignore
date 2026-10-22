@@ -1,0 +1,40 @@
+# Python and environments
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+env/
+venv/
+.venv/
+ENV/
+
+# Local trading settings: copy a settings_N.example.py template first
+/settings_[0-9]*.py
+!/settings_*.example.py
+
+# Trading state, database, observations and local test artifacts
+/runtime/
+state.txt
+state.original.txt
+*.sqlite3
+*.sqlite3-*
+*.lock
+
+# Python and QUIK logs, including rotated archives
+*.log
+*.log.*
+/QuikPy/QUIK/lua/logs/
+
+# Secrets and editor settings
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Embedded repository metadata
+/QuikPy/.git
