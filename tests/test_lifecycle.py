@@ -131,11 +131,21 @@ class LauncherSupervisorTests(unittest.TestCase):
             self.assertIs(run_bot.wait_for_settings(Path('settings_1.py')),cfg)
         sleep.assert_called_once_with(20)
 
-    def test_identical_wait_messages_are_rate_limited(self):
+    def test_identical_wait_messages_are_printed_once(self):
         log=WaitStatus();output=io.StringIO()
-        with patch('lifecycle.time.monotonic',side_effect=[0,20,40,60]),contextlib.redirect_stdout(output):
-            for _ in range(4):log.show('Waiting')
-        self.assertEqual(output.getvalue().count('Waiting'),2)
+        with contextlib.redirect_stdout(output):
+            for _ in range(1000):log.show('Waiting')
+        self.assertEqual(output.getvalue().count('Waiting'),1)
+
+    def test_changed_wait_reason_is_visible_and_clear_starts_a_new_wait(self):
+        log=WaitStatus();output=io.StringIO()
+        with contextlib.redirect_stdout(output):
+            log.show('No connection');log.show('No connection')
+            log.show('Market closed');log.show('Market closed')
+            log.clear()
+            log.show('Market closed')
+        self.assertEqual(output.getvalue().count('No connection'),1)
+        self.assertEqual(output.getvalue().count('Market closed'),2)
 
 
 class PremarketLoopTests(unittest.TestCase):

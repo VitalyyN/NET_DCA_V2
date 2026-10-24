@@ -726,6 +726,8 @@ def connect_and_register():
             client = QuikPy(requests_port=REQUESTS_PORT, callbacks_port=CALLBACKS_PORT)
             registration = client.RegisterBot(BOT_ID, CLASS, SECCODE, BASE_ASSET_CODE, ACCOUNT)['data']
             registration_ready(registration)
+            if _wait_status.message is not None:
+                print(f'{datetime.now():%Y-%m-%d %H:%M:%S} QUIK готов для {CLASS}/{SECCODE}; продолжаем запуск.')
             _wait_status.clear()
             return client, registration
         except KeyboardInterrupt:
