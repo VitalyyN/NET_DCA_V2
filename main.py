@@ -709,7 +709,10 @@ def connect_and_register():
             from run_bot import validate_tick
             validate_tick(_settings, registration)
             if registration['foreign_active_orders'] or registration['unresolved_transactions']:
-                raise RuntimeError('Existing unowned orders or unresolved transactions require reconciliation')
+                raise RuntimeError(f'Existing unowned orders or unresolved transactions require reconciliation: '
+                                   f'foreign_active_orders={registration["foreign_active_orders"]}, '
+                                   f'unresolved_transactions={registration["unresolved_transactions"]}. '
+                                   'Inspect the ledger with recover_transaction.py; do not delete the database.')
             return client, registration
         except (ConnectionError, TimeoutError, OSError) as exc:
             if client is not None:

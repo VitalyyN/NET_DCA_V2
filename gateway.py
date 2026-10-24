@@ -191,6 +191,7 @@ class Engine:
             self.metrics['lua'] = data
             return
         if event['cmd'] == 'OnTransReply':
+            LOGGER.info('TX_REPLY %s', json.dumps(data, ensure_ascii=False))
             row = self.registry.on_reply(data)
             owner = row['bot'] if row else None
         elif event['cmd'] == 'OnOrder':
@@ -248,7 +249,8 @@ class Engine:
             raise ValueError('Cannot change a profile with active orders or unresolved transactions')
         info = self._call('getSecurityInfo', profile['class_code'] + '|' + profile['sec_code'])['data']
         if not info:
-            raise ValueError('Instrument not found in QUIK; check the instrument code')
+            raise ValueError(f'Instrument not found in QUIK: {profile["class_code"]}/{profile["sec_code"]}. '
+                             'Check settings and terminal data availability; an empty order table is unrelated.')
         classes = self._call('getClassesList')['data']
         classes = re.split(r'[;,]', classes) if isinstance(classes, str) else classes
         if not isinstance(classes, list):
@@ -322,8 +324,11 @@ class Engine:
             raise ValueError('TRANS_ID must be a nonnegative integer string')
         outgoing = dict(transaction)
         gid = self.registry.allocate(
-            profile['bot_id'], client_id, action, transaction.get('ORDER_KEY'), session)
+            profile['bot_id'], client_id, action, transaction.get('ORDER_KEY'), session, request=transaction)
         outgoing['TRANS_ID'] = str(gid)
+        LOGGER.info('TX_SEND gid=%s bot=%s action=%s instrument=%s/%s side=%s qty=%s price=%s order=%s',
+                    gid, profile['bot_id'], action, profile['class_code'], profile['sec_code'],
+                    outgoing.get('OPERATION'), outgoing.get('QUANTITY'), outgoing.get('PRICE'), outgoing.get('ORDER_KEY'))
         try:
             response = self._call('sendTransaction', outgoing)
             self.registry.mark(gid, 'sent')

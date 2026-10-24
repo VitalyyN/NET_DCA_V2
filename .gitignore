@@ -38,3 +38,6 @@ state.original.txt
 
 # Embedded repository metadata
 /QuikPy/.git
+
+# Read-only terminal diagnostic exports (may contain account data)
+quik_transaction_audit_*.tsv

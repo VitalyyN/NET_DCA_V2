@@ -1,10 +1,13 @@
 """Persistent transaction ownership; broker history remains on disk."""
 import json
+import logging
 import sqlite3
 import threading
 import time
 
 from transport import RemoteError, TransactionUncertain
+
+LOGGER = logging.getLogger(__name__)
 
 
 def matches(data, profile):
@@ -34,6 +37,8 @@ class Registry:
             CREATE TABLE IF NOT EXISTS last_trades (bot TEXT PRIMARY KEY, payload TEXT NOT NULL);
         """)
         columns = {row[1] for row in self.db.execute('PRAGMA table_info(transactions)')}
+        if 'request' not in columns:
+            self.db.execute('ALTER TABLE transactions ADD COLUMN request TEXT')
         if 'session' not in columns:
             self.db.execute("ALTER TABLE transactions ADD COLUMN session TEXT NOT NULL DEFAULT ''")
         if 'visibility_checked' not in columns:
@@ -46,7 +51,7 @@ class Registry:
         self.sequence = self.db.execute('SELECT COALESCE(MAX(seq),0) FROM orders').fetchone()[0]
         self.db.commit()
 
-    def allocate(self, bot, client_id, action, order_num=None, session=""):
+    def allocate(self, bot, client_id, action, order_num=None, session="", request=None):
         with self.lock:
             if session and self.db.execute(
                     'SELECT 1 FROM transactions WHERE bot=? AND session=? AND client_id=?',
@@ -56,9 +61,10 @@ class Registry:
             gid = max(last or 0, 1000000000) + 1
             if gid > 2147483647:
                 raise RuntimeError('Transaction id range exhausted')
-            self.db.execute('INSERT INTO transactions (gid,bot,client_id,action,state,order_num,reply,created,session) VALUES (?,?,?,?,?,?,?,?,?)',
+            self.db.execute('INSERT INTO transactions (gid,bot,client_id,action,state,order_num,reply,created,session,request) VALUES (?,?,?,?,?,?,?,?,?,?)',
                             (gid, bot, str(client_id), action, 'created',
-                             str(order_num) if order_num else None, None, time.time(), session))
+                             str(order_num) if order_num else None, None, time.time(), session,
+                             json.dumps(dict(request, TRANS_ID=str(gid))) if request is not None else None))
             self.db.commit()
             return gid
 
@@ -100,7 +106,7 @@ class Registry:
     def mark(self, gid, state, reply=None):
         with self.changed:
             current = self.transaction(gid)
-            if current and current['state'] not in ('accepted', 'rejected'):
+            if current and current['state'] not in ('accepted', 'rejected', 'closed_unknown'):
                 self.db.execute('UPDATE transactions SET state=?, reply=COALESCE(?,reply) WHERE gid=?',
                                 (state, json.dumps(reply) if reply else None, gid))
                 self.db.commit()
@@ -188,10 +194,14 @@ class Registry:
                     raise ValueError('Unknown transaction')
                 if row['state'] == 'accepted':
                     return json.loads(row['reply']) if row['reply'] else {'status': 3, 'order_num': row['order_num']}
+                if row['state'] == 'closed_unknown':
+                    raise RemoteError(dict(error='Transaction manually closed with unknown broker outcome; it must not be replayed'))
                 if row['state'] == 'rejected':
                     raise RemoteError(dict(cmd='gateway_error', error=str(json.loads(row['reply'])), data=json.loads(row['reply'])))
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
+                    LOGGER.warning('TX_CONFIRMATION_MISSING gid=%s bot=%s action=%s client_id=%s',
+                                   row['gid'], row['bot'], row['action'], row['client_id'])
                     self.mark(row['gid'], 'uncertain')
                     raise TransactionUncertain(dict(cmd='transaction_uncertain', error='Broker confirmation missing; transaction must not be replayed'))
                 self.changed.wait(remaining)

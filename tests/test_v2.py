@@ -316,6 +316,47 @@ class GatewayTests(unittest.TestCase):
         wait_until(lambda: len(self.engine.registry.active(profile(n))) == 1)
         return self.engine.registry.active(profile(n))[0]
 
+    def test_calendar_spread_far_leg_position_through_shared_gateway(self):
+        original = self.broker.call
+        holdings = []
+        def with_spread_legs(request, client, handler):
+            if request['cmd'] == 'getFuturesClientHoldings':
+                return copy.deepcopy(holdings)
+            return original(request, client, handler)
+        self.broker.call = with_spread_legs
+        client = self.connect(1)
+        spec = importlib.util.spec_from_file_location('spread_position_audit', ROOT/'main.py')
+        bot = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(bot)
+        bot.CLASS, bot.SECCODE, bot.BASE_ASSET_CODE, bot.ACCOUNT = 'FUTSPREAD', 'SPREAD_1', 'LEG_1', 'DEMO'
+        for far_qty in (7, -5, 0):
+            holdings[:] = [dict(sec_code='NEAR_1', trdaccid='DEMO', totalnet=-far_qty),
+                          dict(sec_code='LEG_1', trdaccid='OTHER', totalnet=99),
+                          dict(sec_code='SPREAD_1', trdaccid='DEMO', totalnet=88),
+                          dict(sec_code='LEG_1', trdaccid='DEMO', totalnet=far_qty)]
+            with self.subTest(far_qty=far_qty):
+                self.assertEqual(bot.get_current_position(client), far_qty)
+                self.assertTrue(all(row['trdaccid']=='DEMO' for row in client.GetFuturesHoldings()['data']))
+        # Position is read from LEG_1, but transactions still target the spread.
+        self.create_order(client)
+        self.assertEqual(self.broker.transactions[-1]['SECCODE'], 'SPREAD_1')
+        self.assertEqual(self.broker.transactions[-1]['CLASSCODE'], 'FUTSPREAD')
+
+    def test_position_callbacks_route_by_far_leg_and_account(self):
+        one, two = self.connect(1), self.connect(2)
+        received = [[], []]
+        one.OnFuturesClientHolding = lambda msg: received[0].append(msg['data'])
+        two.OnFuturesClientHolding = lambda msg: received[1].append(msg['data'])
+        events = [dict(sec_code='LEG_1', trdaccid='OTHER', totalnet=99),
+                  dict(sec_code='NEAR_1', trdaccid='DEMO', totalnet=-3),
+                  dict(sec_code='SPREAD_1', trdaccid='DEMO', totalnet=88),
+                  dict(sec_code='LEG_1', trdaccid='DEMO', totalnet=3),
+                  dict(sec_code='LEG_2', trdaccid='DEMO', totalnet=-4)]
+        for data in events:
+            self.server.on_event(dict(cmd='OnFuturesClientHolding', data=data), None)
+        wait_until(lambda: bool(received[0]) and bool(received[1]))
+        self.assertEqual(received, [[events[-2]], [events[-1]]])
+
     def test_three_clients_one_upstream_and_unique_transaction_ids(self):
         clients = [self.connect(n) for n in (1, 2, 3)]
         events = [[], [], []]
@@ -780,6 +821,36 @@ class BotTests(unittest.TestCase):
             bot.retry_pending_grid(client)
             send.assert_not_called()
             self.assertEqual(len(bot.pending_grid_orders), 1)
+
+    def test_position_uses_far_leg_even_when_near_leg_has_opposite_sign(self):
+        bot = self.bot
+        bot.SECCODE, bot.BASE_ASSET_CODE, bot.ACCOUNT = 'NEAR_FAR', 'FAR', 'ACCOUNT_A'
+        client = Mock()
+        for qty in (7, -5, 0):
+            client.GetFuturesHoldings.return_value = {'data': [
+                dict(sec_code='NEAR', trdaccid='ACCOUNT_A', totalnet=-qty),
+                dict(sec_code='NEAR_FAR', trdaccid='ACCOUNT_A', totalnet=100),
+                dict(sec_code='FAR', trdaccid='ACCOUNT_B', totalnet=200),
+                dict(sec_code='FAR', trdaccid='ACCOUNT_A', totalnet=qty)]}
+            with self.subTest(qty=qty):
+                self.assertEqual(bot.get_current_position(client), qty)
+
+    def test_missing_far_leg_is_zero_not_near_leg_position(self):
+        bot = self.bot
+        bot.SECCODE, bot.BASE_ASSET_CODE, bot.ACCOUNT = 'NEAR_FAR', 'FAR', 'ACCOUNT_A'
+        client = Mock()
+        client.GetFuturesHoldings.return_value = {'data': [
+            dict(sec_code='NEAR', trdaccid='ACCOUNT_A', totalnet=-7),
+            dict(sec_code='FAR', trdaccid='ACCOUNT_B', totalnet=7)]}
+        self.assertEqual(bot.get_current_position(client), 0)
+
+    def test_ambiguous_far_leg_records_are_not_summed_or_selected_arbitrarily(self):
+        bot = self.bot
+        client = Mock()
+        row = dict(sec_code=bot.BASE_ASSET_CODE, trdaccid=bot.ACCOUNT, totalnet=7)
+        client.GetFuturesHoldings.return_value = {'data': [row, dict(row, totalnet=2)]}
+        with self.assertRaisesRegex(ValueError, 'Ambiguous position'):
+            bot.get_current_position(client)
 
     def test_position_filters_account(self):
         bot = self.bot
