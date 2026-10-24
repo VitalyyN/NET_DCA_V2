@@ -10,6 +10,7 @@ import time
 import traceback
 import math
 from pathlib import Path
+from lifecycle import WaitStatus
 from decimal import Decimal
 
 import settings as _settings
@@ -41,6 +42,8 @@ file_name = str(STATE_DIR / 'state.txt')
 _cached_step = None
 GC_INTERVAL_CYCLES = 300  # Периодичность очистки мусора (в циклах, ~5 мин при POLL_MS=1)
 grid_order_numbers = set()  # Only orders from the current grid; bounded by 2 * LEVELS.
+grid_build_in_progress = False
+_wait_status = WaitStatus()
 FUNDS_RETRY_SECONDS = 60
 funds_retry_after = {}  # At most two directions; monotonic deadlines.
 pending_grid_orders = []  # Rejected levels of the current grid only, at most 2 * LEVELS.
@@ -575,9 +578,10 @@ def set_grid(qp, price):
         qp: экземпляр QuikPy.
         price (float): базовая цена сетки.
     """
-    global base_price
+    global base_price, grid_build_in_progress
     if not math.isfinite(float(price)):
         raise ValueError('Invalid grid base price')
+    grid_build_in_progress = True
     wait_until_tradable(qp)
     cancel_all_orders(qp)
     grid_order_numbers.clear()
@@ -609,6 +613,8 @@ def set_grid(qp, price):
             sell_budget -= LOT_PER_LEVEL
     if qty == 0:
         base_price = price
+
+    grid_build_in_progress = False
 
 
 def check_base_price_by_grid(qp, price, cur_pos):
@@ -699,36 +705,78 @@ def check_base_price_by_grid(qp, price, cur_pos):
         return (True, False, False)
 
 
+def registration_ready(registration):
+    """Read-only validation; an unresolved transaction blocks new trading."""
+    from run_bot import validate_tick
+    validate_tick(_settings, registration)
+    if registration['foreign_active_orders'] or registration['unresolved_transactions']:
+        raise RuntimeError(f'Торговля заблокирована: чужих заявок '
+                           f'{registration["foreign_active_orders"]}, неопределённых транзакций '
+                           f'{registration["unresolved_transactions"]}. '
+                           'Выполняется только сверка; для старой неопределённости — recover_transaction.py.')
+
+
 def connect_and_register():
-    """Retry transport setup only; never replay a trading transaction."""
+    """Wait for gateway, terminal metadata and ledger readiness without sending orders."""
+    from gateway_control import ensure_gateway
     while True:
         client = None
         try:
+            ensure_gateway(REQUESTS_PORT, CALLBACKS_PORT)
             client = QuikPy(requests_port=REQUESTS_PORT, callbacks_port=CALLBACKS_PORT)
             registration = client.RegisterBot(BOT_ID, CLASS, SECCODE, BASE_ASSET_CODE, ACCOUNT)['data']
-            from run_bot import validate_tick
-            validate_tick(_settings, registration)
-            if registration['foreign_active_orders'] or registration['unresolved_transactions']:
-                raise RuntimeError(f'Existing unowned orders or unresolved transactions require reconciliation: '
-                                   f'foreign_active_orders={registration["foreign_active_orders"]}, '
-                                   f'unresolved_transactions={registration["unresolved_transactions"]}. '
-                                   'Inspect the ledger with recover_transaction.py; do not delete the database.')
+            registration_ready(registration)
+            _wait_status.clear()
             return client, registration
-        except (ConnectionError, TimeoutError, OSError) as exc:
+        except KeyboardInterrupt:
             if client is not None:
-                client.CloseConnectionAndThread()
-            print(f'Ожидание подключения к QUIK: {exc}. Повтор через {RECONNECT_DELAY_SEC} сек. '
-                  'Проверьте, что QuikSharp.lua запущен в терминале. Для выхода нажмите Ctrl+C.', flush=True)
-            time.sleep(RECONNECT_DELAY_SEC)
-            from gateway_control import ensure_gateway
-            try:
-                ensure_gateway(REQUESTS_PORT, CALLBACKS_PORT)
-            except (ConnectionError, TimeoutError, OSError) as retry_error:
-                print(f'Шлюз пока недоступен: {retry_error}', flush=True)
-        except BaseException:
-            if client is not None:
-                client.CloseConnectionAndThread()
+                try:
+                    if client.connected and getattr(client, '_registration', None):
+                        cancel_all_orders(client)
+                except Exception as exc:
+                    print(f'Не удалось подтвердить снятие заявок при остановке: {exc}')
+                finally:
+                    client.CloseConnectionAndThread()
             raise
+        except Exception as exc:
+            if client is not None:
+                client.CloseConnectionAndThread()
+            _wait_status.show(f'Ожидание готовности QUIK для {CLASS}/{SECCODE}: {exc}. '
+                              f'Повторная проверка через {RECONNECT_DELAY_SEC} сек. '
+                              'Новые заявки не отправляются. Выход — Ctrl+C.')
+            time.sleep(RECONNECT_DELAY_SEC)
+
+
+def wait_for_runtime_ready(qp, error):
+    """Keep the process alive while reconciling; never replay the failed request."""
+    global _cached_step
+    from gateway_control import ensure_gateway
+    reason = error
+    while True:
+        _wait_status.show(f'Работа приостановлена: {reason}. '
+                          f'Повторная сверка через {RECONNECT_DELAY_SEC} сек.; новые заявки заблокированы.')
+        time.sleep(RECONNECT_DELAY_SEC)
+        try:
+            ensure_gateway(REQUESTS_PORT, CALLBACKS_PORT)
+            if not qp.connected:
+                qp.Reconnect()
+            registration = qp.RegisterBot(BOT_ID, CLASS, SECCODE, BASE_ASSET_CODE, ACCOUNT)['data']
+            registration_ready(registration)
+            if not check_quik_connection(qp):
+                raise RuntimeError('QUIK не подключён к серверу')
+            if not check_time(qp):
+                raise RuntimeError(f'Вне рабочего времени {START_TIME}–{END_TIME}')
+            if not check_session_status(qp):
+                raise RuntimeError('Торговая сессия закрыта или её статус пока недоступен')
+            qp.RefreshOrders()
+            get_current_position(qp)
+            get_current_price(qp)
+            _cached_step = float(registration['tick']['param_value'])
+            print(f'{datetime.now():%Y-%m-%d %H:%M:%S} Данные и заявки сверены; возобновляем работу.')
+            _wait_status.clear()
+            return
+        except Exception as exc:
+            reason = exc
 
 
 if __name__ == "__main__":
@@ -737,6 +785,7 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         print('Подключение остановлено пользователем')
         raise SystemExit(0)
+    stop_requested = False
     print("\n\n=============================================")
     print(f"Grid bot is running for {SECCODE}")
     print(f"Connected to QuikPy on ports {REQUESTS_PORT}/{CALLBACKS_PORT}")
@@ -853,10 +902,10 @@ if __name__ == "__main__":
             base_price = get_current_price(qp)
             print(f'Base price initialized: {base_price}')
 
+        # Save the anchor before the first send so an early failure cannot reset it.
+        write_in_file(base_price)
         set_grid(qp, base_price)
         print(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} Сетка выставлена. Базовая цена: {base_price}\n")
-        # Сохраняем базовую цену на диск для последующих перезапусков
-        write_in_file(base_price)
         time.sleep(POLL_MS * 2)
 
         # Основной цикл работы робота: следим за временем, состоянием позиций и активными заявками
@@ -981,6 +1030,9 @@ if __name__ == "__main__":
                             print(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} Сетка выставлена после исполнения заявки")
                         # else: продолжаем ждать исполнения
                     elif need_grid:
+                        if grid_build_in_progress:
+                            set_grid(qp, base_price)
+                            print(f'{datetime.now():%Y-%m-%d %H:%M:%S} Незавершённая сетка восстановлена после сверки.')
                         retry_pending_grid(qp)
                         # Цена в канале — проверяем, есть ли заявки
                         orders = find_active_orders(qp)
@@ -992,7 +1044,8 @@ if __name__ == "__main__":
                     # else: цена вне канала — ждём возврата, ничего не делаем
                         
                     # Проверяем, не изменилась ли позиция (уровень сетки исполнился)
-                    if check_position_change_and_update(cur_pos) and check_levels_executed(cur_pos, qp):
+                    check_position_change_and_update(cur_pos)
+                    if check_levels_executed(cur_pos, qp):
                         # Уровень сетки исполнился — переставляем сетку
                         set_grid(qp, base_price)
                         print(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} Сетка переставлена. Базовая цена: {base_price}\n")
@@ -1002,42 +1055,20 @@ if __name__ == "__main__":
                 count_exept = 0
                 time.sleep(POLL_MS)
                 
-            except (TransactionUncertain, RemoteError):
-                raise  # Never rebuild/replay a transaction with an unknown result.
-            except (ConnectionError, TimeoutError, OSError):
-                print('Transport disconnected; waiting to reconcile QUIK state')
-                while True:
-                    time.sleep(RECONNECT_DELAY_SEC)
-                    try:
-                        from gateway_control import ensure_gateway
-                        ensure_gateway(REQUESTS_PORT, CALLBACKS_PORT)
-                        qp.Reconnect()
-                        qp.RefreshOrders()
-                        break
-                    except TransactionUncertain:
-                        raise
-                    except (ConnectionError, TimeoutError, OSError):
-                        continue
-                connection_lost = True
+            except Exception as exc:
+                wait_for_runtime_ready(qp, exc)
+                connection_lost = True  # Preserve the existing post-recovery stabilization delay.
+                count_exept = 0
                 continue
-            except Exception as e:
-                print("\n❗ Exception occurred:")
-                print(traceback.format_exc())
-                # Ограничиваем число подряд возникших исключений
-                count_exept += 1
-                if count_exept >= 3:
-                    break
-                time.sleep(POLL_MS)
-                continue
-        raise Exception("Max count of exceptions")
-    except Exception as e:
-        print(e)
+    except Exception:
+        raise  # The launcher waits and retries read-only initialization after early failures.
     except KeyboardInterrupt:
+        stop_requested = True
         print('Робот остановлен пользователем')
     finally:
         # Перед выходом снимаем все заявки и закрываем соединение с QUIK
         try:
-            if qp.connected:
+            if stop_requested and qp.connected:
                 cancel_all_orders(qp)
         except Exception as cleanup_error:
             print(f'Orders could not be confirmed cancelled: {cleanup_error}')

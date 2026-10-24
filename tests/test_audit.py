@@ -30,17 +30,20 @@ class StrategyAuditTests(unittest.TestCase):
         first.SendTransaction.assert_not_called()
         second.SendTransaction.assert_not_called()
 
-    def test_startup_does_not_retry_unresolved_transactions(self):
+    def test_startup_waits_for_unresolved_transactions_without_replaying_them(self):
         bot = self.bot
         client = Mock()
         client.RegisterBot.side_effect = fixtures.TransactionUncertain({'error':'Uncertain transaction'})
         with patch.object(bot,'QuikPy',return_value=client) as factory, \
-             patch.object(bot.time,'sleep') as sleep:
-            with self.assertRaises(fixtures.TransactionUncertain):
+             patch.object(bot.time,'sleep',side_effect=KeyboardInterrupt) as sleep, \
+             patch('gateway_control.ensure_gateway'):
+            with self.assertRaises(KeyboardInterrupt):
                 bot.connect_and_register()
         factory.assert_called_once()
-        sleep.assert_not_called()
+        sleep.assert_called_once_with(bot.RECONNECT_DELAY_SEC)
         client.CloseConnectionAndThread.assert_called_once()
+        client.SendTransaction.assert_not_called()
+
     def original(self, name):
         tree = ast.parse((ROOT.parent / 'NetDCA' / 'main.py').read_text(encoding='utf-8-sig'))
         node = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == name)
@@ -172,7 +175,7 @@ class StrategyAuditTests(unittest.TestCase):
                 self.assertEqual(bot.base_price,base)
 
     def run_main_loop(self, *, connections, sessions, positions, prices, stop_after,
-                      saved_base=100, grid_step=20, keep_orders=False):
+                      saved_base=100, grid_step=20, keep_orders=False, times=None):
         tree = ast.parse((ROOT/'main.py').read_text(encoding='utf-8-sig'))
         scope = dict(vars(self.bot))
         functions = [n for n in tree.body if isinstance(n,ast.FunctionDef)]
@@ -189,9 +192,10 @@ class StrategyAuditTests(unittest.TestCase):
         client.RegisterBot.return_value = {'data': {
             'tick':{'param_value':'1'}, 'foreign_active_orders':0,'unresolved_transactions':0}}
         client.GetInfoParam.return_value = {'data':'12:00:00'}
+        client.GetOrders.return_value = {'data': []}
         scope.update(QuikPy=lambda **kw: client, time=types.SimpleNamespace(sleep=sleep),
             GRID_STEP=grid_step, LOT_PER_LEVEL=1, LEVELS=1, POLL_MS=1,
-            check_time=lambda qp: True, check_quik_connection=sequence(connections),
+            check_time=sequence(times or [True]), check_quik_connection=sequence(connections),
             check_session_status=sequence(sessions), get_current_position=sequence(positions),
             get_current_price=sequence(prices), read_from_file=lambda:saved_base,
             get_last_trade_price=lambda qp:99, write_in_file=Mock(),
@@ -200,7 +204,7 @@ class StrategyAuditTests(unittest.TestCase):
             send_limit_order=Mock())
         main = next(n for n in tree.body if isinstance(n,ast.If) and
                     ast.unparse(n.test) == "__name__ == '__main__'")
-        with contextlib.redirect_stdout(io.StringIO()):
+        with contextlib.redirect_stdout(io.StringIO()), patch('gateway_control.ensure_gateway'):
             exec(compile(ast.Module(body=main.body,type_ignores=[]),'<actual v2 loop>','exec'),scope)
         return scope,grids,delays
 

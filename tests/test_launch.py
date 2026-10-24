@@ -35,7 +35,7 @@ class LaunchTests(unittest.TestCase):
         self.root = Path(self.directory.name)
         for name in ('gateway.py', 'gateway_control.py', 'transport.py', 'registry.py',
                      'telemetry.py', 'run_bot.py', 'main.py', 'log_policy.py',
-                     'gateway_bootstrap.py'):
+                     'gateway_bootstrap.py', 'lifecycle.py'):
             shutil.copy2(ROOT/name, self.root/name)
         shutil.copytree(ROOT/'QuikPy', self.root/'QuikPy')
         self.port = free_port()

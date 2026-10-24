@@ -10,6 +10,8 @@ from pathlib import Path
 import runpy
 import sys
 import re
+import time
+from lifecycle import WaitStatus
 
 ROOT = Path(__file__).resolve().parent
 
@@ -89,14 +91,40 @@ def execute_bot(settings):
     try:
         with contextlib.redirect_stdout(ConsoleLog(sys.stdout, logger)), \
              contextlib.redirect_stderr(ConsoleLog(sys.stderr, logger)):
-            try:
-                runpy.run_path(str(ROOT/'main.py'), run_name='__main__')
-            except Exception:
-                logger.exception('Bot startup failed')
-                raise
+            status = WaitStatus()
+            while True:
+                try:
+                    runpy.run_path(str(ROOT/'main.py'), run_name='__main__')
+                    return
+                except KeyboardInterrupt:
+                    print('Робот остановлен пользователем')
+                    return
+                except SystemExit as exc:
+                    if exc.code in (None, 0):
+                        return
+                    reason = f'Завершение с кодом {exc.code}'
+                except Exception as exc:
+                    reason = f'{type(exc).__name__}: {exc}'
+                status.show(f'Ожидание после ошибки инициализации: {reason}. '
+                            'Повторная загрузка с обязательной сверкой заявок и состояния.')
+                try:
+                    time.sleep(settings.RECONNECT_DELAY_SEC)
+                except KeyboardInterrupt:
+                    print('Робот остановлен пользователем')
+                    return
     finally:
         logger.removeHandler(handler)
         handler.close()
+
+
+def wait_for_settings(path):
+    status = WaitStatus()
+    while True:
+        try:
+            return load_settings(path)
+        except Exception as exc:
+            status.show(f'Настройки пока не готовы: {exc}. Исправьте файл; повтор через 20 сек. Выход — Ctrl+C.')
+            time.sleep(20)
 
 
 def launch(default='settings_1.py'):
@@ -105,10 +133,15 @@ def launch(default='settings_1.py'):
     parser.add_argument('--check', action='store_true', help='Read-only registration and position check')
     args = parser.parse_args()
     path = Path(args.settings)
-    settings = load_settings(path if path.is_absolute() else ROOT / path)
+    path = path if path.is_absolute() else ROOT / path
+    try:
+        settings = load_settings(path) if args.check else wait_for_settings(path)
+    except KeyboardInterrupt:
+        print('Робот остановлен пользователем')
+        return
     from gateway_control import ensure_gateway
-    ensure_gateway(settings.REQUESTS_PORT, settings.CALLBACKS_PORT)
     if args.check:
+        ensure_gateway(settings.REQUESTS_PORT, settings.CALLBACKS_PORT)
         from QuikPy import QuikPy
         with QuikPy(requests_port=settings.REQUESTS_PORT, callbacks_port=settings.CALLBACKS_PORT) as qp:
             result = qp.RegisterBot(settings.BOT_ID, settings.CLASS, settings.SECCODE, settings.BASE_ASSET_CODE, settings.ACCOUNT)
