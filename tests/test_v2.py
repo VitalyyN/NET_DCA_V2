@@ -248,6 +248,22 @@ class RegistryTests(unittest.TestCase):
             self.registry.wait('bot_1', '9', 0.01)
         self.assertEqual(self.registry.unresolved('bot_1'), 1)
 
+    def test_broker_status_distinguishes_refusal_from_unknown_outcome(self):
+        for status in (12, 15, 99):
+            gid = self.registry.allocate('bot_1', str(status), 'NEW_ORDER')
+            self.registry.on_reply(dict(trans_id=gid, status=status, order_num=0))
+            self.assertEqual(self.registry.transaction(gid)['state'], 'uncertain')
+        gid = self.registry.allocate('bot_2', '2', 'NEW_ORDER')
+        self.registry.on_reply(dict(trans_id=gid, status=2, order_num=0))
+        self.assertEqual(self.registry.transaction(gid)['state'], 'rejected')
+
+    def test_late_ambiguous_reply_cannot_override_confirmed_acceptance(self):
+        gid = self.registry.allocate('bot_1', '2', 'NEW_ORDER')
+        self.registry.on_reply(dict(trans_id=gid, status=3, order_num=123))
+        self.registry.on_reply(dict(trans_id=gid, status=12, order_num=0))
+        self.assertEqual(self.registry.transaction(gid)['state'], 'accepted')
+        self.assertEqual(self.registry.transaction(gid)['order_num'], '123')
+
     def test_wrong_account_order_is_not_verified_even_with_known_transaction(self):
         p = profile()
         gid = self.registry.allocate('bot_1','2','NEW_ORDER')

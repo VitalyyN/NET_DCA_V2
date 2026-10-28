@@ -118,7 +118,11 @@ class Registry:
         if row is None:
             return None
         status = int(data.get('status', -1))
-        if status >= 3:
+        # QUIK status 12 is a timeout, not a refusal. Status 15 and unknown
+        # statuses also cannot establish whether a new order reached the venue.
+        if status not in (0, 1, 2, 3, 4, 5, 6, 10, 11, 13, 14, 16):
+            self.mark(gid, 'uncertain', data)
+        elif status in (2, 3, 4, 5, 6, 10, 11, 13, 14, 16):
             with self.changed:
                 number = data.get('order_num')
                 self.db.execute('UPDATE transactions SET state=?, reply=?, order_num=COALESCE(?,order_num) WHERE gid=?',
