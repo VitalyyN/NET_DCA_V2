@@ -74,6 +74,47 @@ class LifecycleTests(unittest.TestCase):
             self.bot.wait_for_runtime_ready(qp,RemoteError({'error':'market closed'}))
         self.assertEqual(sleep.call_count,3);qp.SendTransaction.assert_not_called()
 
+    def test_runtime_wait_rechecks_the_missing_grid_order_before_resuming(self):
+        qp=Mock(connected=True);qp.RegisterBot.return_value=ready()
+        number='2024401013557188673'
+        self.bot.grid_order_numbers.add(number)
+        qp.GetOrders.return_value={'data':[]}
+        qp.GetTrades.return_value={'data':[]}
+        valid=dict(order_num=int(number),class_code=self.bot.CLASS,sec_code=self.bot.SECCODE,
+                   account=self.bot.ACCOUNT,flags=28,balance=0,price=100)
+        qp.GetOrderByClassNumber.side_effect=[{'data':None},{'data':None},{'data':valid},{'data':valid}]
+        reason=TransactionUncertain({'error':f'Cannot verify grid order {number}; QUIK не вернул заявку; replacement stopped'})
+        output=io.StringIO()
+        with patch('gateway_control.ensure_gateway'),patch.object(self.bot.time,'sleep') as sleep, \
+             patch.object(self.bot,'check_quik_connection',return_value=True), \
+             patch.object(self.bot,'check_time',return_value=True),patch.object(self.bot,'check_session_status',return_value=True), \
+             patch.object(self.bot,'get_current_position',return_value=0),patch.object(self.bot,'get_current_price',return_value=100), \
+             contextlib.redirect_stdout(output):
+            self.bot.wait_for_runtime_ready(qp,reason)
+        self.assertEqual(sleep.call_count,3)
+        self.assertEqual(qp.GetOrderByClassNumber.call_count,3)
+        self.assertEqual(output.getvalue().count('Работа приостановлена:'),1)
+        self.assertEqual(output.getvalue().count('возобновляем работу'),1)
+        self.assertEqual(self.bot.grid_order_numbers,{number})
+        qp.SendTransaction.assert_not_called()
+        self.assertEqual(self.bot.completed_grid_level(qp)['order_num'],int(number))
+
+    def test_runtime_wait_never_accepts_wrong_order_identity(self):
+        qp=Mock(connected=True);qp.RegisterBot.return_value=ready()
+        self.bot.grid_order_numbers.add('101')
+        qp.GetOrders.return_value={'data':[]}
+        qp.GetOrderByClassNumber.return_value={'data':dict(order_num=101,class_code=self.bot.CLASS,
+            sec_code=self.bot.SECCODE,account='OTHER',flags=28,balance=0)}
+        with patch('gateway_control.ensure_gateway'),patch.object(self.bot.time,'sleep',side_effect=[None,None,KeyboardInterrupt]), \
+             patch.object(self.bot,'check_quik_connection',return_value=True), \
+             patch.object(self.bot,'check_time',return_value=True),patch.object(self.bot,'check_session_status',return_value=True), \
+             patch.object(self.bot,'get_current_position',return_value=0),patch.object(self.bot,'get_current_price',return_value=100), \
+             contextlib.redirect_stdout(io.StringIO()):
+            with self.assertRaises(KeyboardInterrupt):
+                self.bot.wait_for_runtime_ready(qp,RuntimeError('unknown order'))
+        self.assertEqual(self.bot.grid_order_numbers,{'101'})
+        qp.SendTransaction.assert_not_called()
+
     def test_persistent_error_stays_alive_until_user_interrupts(self):
         qp=Mock(connected=True);qp.RegisterBot.side_effect=RemoteError({'error':'still unavailable'})
         with patch('gateway_control.ensure_gateway'),patch.object(self.bot.time,'sleep',side_effect=[None,None,KeyboardInterrupt]):

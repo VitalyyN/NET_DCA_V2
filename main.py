@@ -221,6 +221,40 @@ def check_position_change_and_update(cur_pos):
     return False
 
 
+def read_tracked_grid_order(qp, number):
+    """Verify a tracked order without changing the grid or its base price."""
+    order = qp.GetOrderByClassNumber(CLASS, number)['data']
+    if not isinstance(order, dict):
+        detail = 'QUIK не вернул заявку'
+    elif str(order.get('order_num')) != number:
+        detail = f'QUIK вернул другой номер: {order.get("order_num")}'
+    elif (order.get('class_code') != CLASS or order.get('sec_code') != SECCODE
+          or order.get('account', order.get('trdaccid')) != ACCOUNT):
+        detail = 'класс, инструмент или счёт не совпадают'
+    else:
+        try:
+            int(order['flags'])
+            balance = float(order['balance'])
+            if not math.isfinite(balance) or balance < 0:
+                raise ValueError('invalid balance')
+        except (KeyError, TypeError, ValueError, OverflowError):
+            detail = 'недоступны корректные статус или остаток'
+        else:
+            return order
+    raise TransactionUncertain(dict(error=f'Cannot verify grid order {number}; '
+                                    f'{detail}; replacement stopped'))
+
+
+def verify_tracked_grid_orders(qp):
+    """Check missing tracked orders before reporting runtime recovery."""
+    if not grid_order_numbers:
+        return
+    active = {str(number) for number in find_active_orders(qp)}
+    for number in sorted(grid_order_numbers):
+        if number not in active:
+            read_tracked_grid_order(qp, number)
+
+
 def completed_grid_level(qp):
     """Detect a fully filled own level even when opposite fills offset position."""
     if not grid_order_numbers:
@@ -230,11 +264,7 @@ def completed_grid_level(qp):
     for number in tuple(grid_order_numbers):
         if number in active:
             continue  # A partial fill retains its active order and remaining quantity.
-        order = qp.GetOrderByClassNumber(CLASS, number)['data']
-        if (not isinstance(order, dict) or str(order.get('order_num')) != number
-                or order.get('class_code') != CLASS or order.get('sec_code') != SECCODE
-                or order.get('account', order.get('trdaccid')) != ACCOUNT):
-            raise TransactionUncertain(dict(error=f'Cannot verify grid order {number}; replacement stopped'))
+        order = read_tracked_grid_order(qp, number)
         flags = int(order['flags'])
         if flags & 1:
             continue  # A stale active snapshot is not proof of execution.
@@ -773,6 +803,7 @@ def wait_for_runtime_ready(qp, error):
             qp.RefreshOrders()
             get_current_position(qp)
             get_current_price(qp)
+            verify_tracked_grid_orders(qp)
             _cached_step = float(registration['tick']['param_value'])
             print(f'{datetime.now():%Y-%m-%d %H:%M:%S} Данные и заявки сверены; возобновляем работу.')
             _wait_status.clear()
