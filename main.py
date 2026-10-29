@@ -109,27 +109,32 @@ def retry_pending_grid(qp):
     if not pending_grid_orders or all(time.monotonic() < funds_retry_after.get(side, 0)
                                       for _, _, side in pending_grid_orders):
         return
-    qp.RefreshOrders()
-    orders = [o for o in qp.GetOrders(CLASS, SECCODE)['data'] if int(o['flags']) & 1]
-    qty = get_current_position(qp)
-    budgets = {'B': max(0, MAX_LOTS_TOTAL - qty), 'S': max(0, MAX_LOTS_TOTAL + qty)}
-    occupied = set()
-    for order in orders:
-        side = 'S' if int(order['flags']) & 4 else 'B'
-        budgets[side] -= int(order['balance'])
-        occupied.add((Decimal(str(order['price'])), side))
     for price, volume, side in tuple(pending_grid_orders):
+        if time.monotonic() < funds_retry_after.get(side, 0):
+            continue
+        qp.RefreshOrders(strict=True)
+        if completed_grid_level(qp) is not None:
+            return  # The normal loop must process the execution before repairs.
+        orders = [o for o in qp.GetOrders(CLASS, SECCODE)['data'] if int(o['flags']) & 1]
+        qty = get_current_position(qp)
+        budgets = {'B': max(0, MAX_LOTS_TOTAL - qty), 'S': max(0, MAX_LOTS_TOTAL + qty)}
+        occupied = set()
+        for order in orders:
+            order_side = 'S' if int(order['flags']) & 4 else 'B'
+            budgets[order_side] -= int(order['balance'])
+            occupied.add((Decimal(str(order['price'])), order_side))
         item = (price, volume, side)
         if (Decimal(str(price)), side) in occupied:
             pending_grid_orders.remove(item)
             continue
         if budgets[side] < volume:
             continue
+        if not check_quik_connection(qp) or not check_time(qp) or not check_session_status(qp):
+            raise RuntimeError('Торговля недоступна во время сверки сетки')
         reply = send_limit_order(qp, price, volume, side)
         if isinstance(reply, dict) and reply.get('order_num'):
             grid_order_numbers.add(str(reply['order_num']))
             pending_grid_orders.remove(item)
-            budgets[side] -= volume
             print(f'{datetime.now():%Y-%m-%d %H:%M:%S} Восстановлен уровень: {side}, {volume} лотов по {price}')
 
 
@@ -598,6 +603,56 @@ def has_duplicate_orders(qp):
             or any(sum(side == direction for _, side in keys) > LEVELS for direction in (0, 4)))
 
 
+def reconcile_grid(qp, price, position_now):
+    """Repair missing levels against a fresh QUIK snapshot, preserving partial orders."""
+    orders = [o for o in qp.GetOrders(CLASS, SECCODE)['data'] if int(o['flags']) & 1]
+    if not orders:
+        retry_pending_grid(qp)
+        return  # The existing empty-grid path performs a full, gated rebuild.
+    desired = {}
+    for level in range(1, LEVELS + 1):
+        for side, sign in (('B', -1), ('S', 1)):
+            level_price = round(float(price + sign * level * GRID_STEP), 6)
+            desired[(Decimal(str(level_price)), side)] = level_price
+    occupied = set()
+    budgets = {'B': max(0, MAX_LOTS_TOTAL - position_now),
+               'S': max(0, MAX_LOTS_TOTAL + position_now)}
+    for order in orders:
+        try:
+            side = 'S' if int(order['flags']) & 4 else 'B'
+            key = (Decimal(str(order['price'])), side)
+            quantity = Decimal(str(order['qty']))
+            balance = Decimal(str(order['balance']))
+            number = str(order['order_num'])
+            if (not key[0].is_finite() or not quantity.is_finite() or not balance.is_finite() or quantity <= 0
+                    or balance <= 0 or balance > quantity or not number.isdigit()):
+                raise ValueError('invalid order fields')
+        except (KeyError, TypeError, ValueError, ArithmeticError) as exc:
+            raise TransactionUncertain(dict(error='QUIK returned an invalid active order; grid reconciliation stopped')) from exc
+        if key not in desired or key in occupied or quantity != LOT_PER_LEVEL:
+            print(f'{datetime.now():%Y-%m-%d %H:%M:%S} Сетка не соответствует заявкам QUIK; сверяем и перестраиваем.')
+            set_grid(qp, price)
+            return
+        occupied.add(key)
+        budgets[side] -= balance
+        grid_order_numbers.add(number)
+    if any(value < 0 for value in budgets.values()):
+        print(f'{datetime.now():%Y-%m-%d %H:%M:%S} Остатки заявок превышают лимит позиции; перестраиваем сетку.')
+        set_grid(qp, price)
+        return
+    pending = {(Decimal(str(round(float(p), 6))), side) for p, _, side in pending_grid_orders}
+    for key, level_price in desired.items():
+        _, side = key
+        if key in occupied:
+            continue
+        if budgets[side] >= LOT_PER_LEVEL:
+            if key not in pending:
+                pending_grid_orders.append((level_price, LOT_PER_LEVEL, side))
+                pending.add(key)
+            budgets[side] -= LOT_PER_LEVEL
+    retry_pending_grid(qp)
+
+
 def set_grid(qp, price):
     """Выставляет сетку лимитных заявок вокруг заданной цены.
 
@@ -802,7 +857,7 @@ def wait_for_runtime_ready(qp, error):
                 raise RuntimeError(f'Вне рабочего времени {START_TIME}–{END_TIME}')
             if not check_session_status(qp):
                 raise RuntimeError('Торговая сессия закрыта или её статус пока недоступен')
-            qp.RefreshOrders()
+            qp.RefreshOrders(strict=True)
             get_current_position(qp)
             get_current_price(qp)
             verify_tracked_grid_orders(qp)
@@ -946,6 +1001,8 @@ if __name__ == "__main__":
         # Основной цикл работы робота: следим за временем, состоянием позиций и активными заявками
         in_session_wait = False
         connection_lost = False
+        time_wait = False
+        reconciliation_due = False
         cycle_counter = 1  # Счётчик циклов для проверки дублирования заявок
         waiting_for_price = False
         
@@ -960,11 +1017,20 @@ if __name__ == "__main__":
 
                 # Проверяем торговое время — если вне окна, просто ждём
                 if not check_time(qp):
+                    time_wait = True
+                    reconciliation_due = True
                     time.sleep(POLL_MS)
+                    continue
+
+                if time_wait:
+                    time_wait = False
+                    print(f'{datetime.now():%Y-%m-%d %H:%M:%S} Торговое время наступило; стабилизация данных.')
+                    time.sleep(STABILIZATION_DELAY_SEC)
                     continue
 
                 # Проверяем соединение QUIK с сервером
                 if not check_quik_connection(qp):
+                    reconciliation_due = True
                     if not connection_lost:
                         print(f"\n{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} QUIK отключен от сервера. Ожидание подключения...")
                         connection_lost = True
@@ -976,6 +1042,10 @@ if __name__ == "__main__":
                     print(f"\n{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} QUIK подключен к серверу — возобновляем работу...")
                     # После подключения даем время на получение актуальных данных
                     time.sleep(RECONNECT_DELAY_SEC)
+                    wait_until_tradable(qp)
+                    qp.RefreshOrders(strict=True)
+                    verify_tracked_grid_orders(qp)
+                    reconciliation_due = True
                     # Проверяем, не закрылась ли позиция во время разрыва
                     cur_pos_after_connect = get_current_position(qp)
                     if cur_pos_after_connect == 0 and position != 0:
@@ -993,6 +1063,7 @@ if __name__ == "__main__":
 
                 # Проверяем статус сессии — если закрыта (клиринг), ждём
                 if not check_session_status(qp):
+                    reconciliation_due = True
                     if not in_session_wait:
                         print(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} Сессия закрыта (клиринг/перерыв). Ожидание...")
                         in_session_wait = True
@@ -1004,13 +1075,23 @@ if __name__ == "__main__":
                     # Задержка стабилизации данных после клиринга
                     print(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} Стабилизация данных после клиринга ({STABILIZATION_DELAY_SEC} сек)...")
                     time.sleep(STABILIZATION_DELAY_SEC)
+                    reconciliation_due = True
                     # Восстановление пройдёт в обычном цикле с ожиданием возврата цены.
                     continue
+
+                # Reconcile immediately after any observed pause, before trading.
+                orders_reconciled = False
+                if reconciliation_due:
+                    qp.RefreshOrders(strict=True)
+                    verify_tracked_grid_orders(qp)
+                    reconciliation_due = False
+                    orders_reconciled = True
 
                 # Сверяем заявки после задержек восстановления и проверки сессии.
                 if cycle_counter >= 10:
                     cycle_counter = 0
-                    qp.RefreshOrders()
+                    qp.RefreshOrders(strict=True)
+                    orders_reconciled = True
                     if has_duplicate_orders(qp):
                         print(f"\n{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} Обнаружены дубли заявок или превышение числа уровней. Отменяем все...")
                         cancel_all_orders(qp)
@@ -1068,7 +1149,10 @@ if __name__ == "__main__":
                         if grid_build_in_progress:
                             set_grid(qp, base_price)
                             print(f'{datetime.now():%Y-%m-%d %H:%M:%S} Незавершённая сетка восстановлена после сверки.')
-                        retry_pending_grid(qp)
+                        if orders_reconciled:
+                            reconcile_grid(qp, base_price, cur_pos)
+                        else:
+                            retry_pending_grid(qp)
                         # Цена в канале — проверяем, есть ли заявки
                         orders = find_active_orders(qp)
                         if len(orders) == 0 and not pending_grid_orders:
@@ -1093,6 +1177,7 @@ if __name__ == "__main__":
             except Exception as exc:
                 wait_for_runtime_ready(qp, exc)
                 connection_lost = True  # Preserve the existing post-recovery stabilization delay.
+                reconciliation_due = True
                 count_exept = 0
                 continue
     except Exception:

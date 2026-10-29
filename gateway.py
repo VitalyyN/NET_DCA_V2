@@ -380,6 +380,11 @@ class Engine:
             if profile is None:
                 raise ValueError('Bot not registered')
             self.refresh(profile)
+            if isinstance(data, dict) and data.get('strict') is True:
+                if self.registry.active(profile, owned=False):
+                    raise ValueError('Unowned active orders exist; reconcile them before trading')
+                if self.registry.unresolved(profile['bot_id']):
+                    raise TransactionUncertain(dict(error='Resolve the previous transaction before trading'))
             return self.registry.active(profile)
         if cmd == 'GatewayConfirmedUnfilledCancellation':
             if profile is None:

@@ -379,6 +379,110 @@ class GatewayTests(unittest.TestCase):
         self.assertEqual(bot.base_price,1400)
         self.assertEqual(self.broker.transactions,[])
 
+    def test_reconcile_restores_only_missing_level_and_preserves_partial_order(self):
+        client=self.connect()
+        p=profile()
+        spec=importlib.util.spec_from_file_location('grid_reconcile',ROOT/'main.py')
+        bot=importlib.util.module_from_spec(spec);spec.loader.exec_module(bot)
+        bot.CLASS,bot.SECCODE,bot.BASE_ASSET_CODE,bot.ACCOUNT=p['class_code'],p['sec_code'],p['base_asset_code'],p['account']
+        bot.LEVELS,bot.LOT_PER_LEVEL,bot.GRID_STEP,bot.MAX_LOTS_TOTAL=1,2,1,10
+        bot._cached_step=1
+        with patch.object(bot,'wait_until_tradable'),patch.object(bot,'get_current_position',return_value=0):
+            bot.set_grid(client,100)
+        initial=client.GetOrders(p['class_code'],p['sec_code'])['data']
+        buy=next(o for o in initial if o['price']==99)
+        sell=next(o for o in initial if o['price']==101)
+        buy['balance']=1
+        sell['flags']=6
+        for order in (buy,sell):
+            self.broker.orders[order['order_num']]=copy.deepcopy(order)
+            self.engine.on_event(dict(cmd='OnOrder',data=order))
+        client.RefreshOrders()
+        self.assertIsNone(bot.completed_grid_level(client))
+        original_count=len(self.broker.transactions)
+        with patch.object(bot,'get_current_position',return_value=1),patch.object(bot,'set_grid') as rebuild:
+            bot.reconcile_grid(client,100,1)
+        rebuild.assert_not_called()
+        self.assertEqual(len(self.broker.transactions),original_count+1)
+        self.assertEqual(self.broker.transactions[-1]['ACTION'],'NEW_ORDER')
+        self.assertEqual(self.broker.transactions[-1]['OPERATION'],'S')
+        active=client.GetOrders(p['class_code'],p['sec_code'])['data']
+        self.assertEqual(len(active),2)
+        self.assertTrue(any(o['order_num']==buy['order_num'] and o['balance']==1 for o in active))
+
+    def test_reconcile_restores_level_cancelled_before_quik_table_rollover(self):
+        client=self.connect();p=profile()
+        spec=importlib.util.spec_from_file_location('grid_reconcile_rollover',ROOT/'main.py')
+        bot=importlib.util.module_from_spec(spec);spec.loader.exec_module(bot)
+        bot.CLASS,bot.SECCODE,bot.BASE_ASSET_CODE,bot.ACCOUNT=p['class_code'],p['sec_code'],p['base_asset_code'],p['account']
+        bot.LEVELS,bot.LOT_PER_LEVEL,bot.GRID_STEP,bot.MAX_LOTS_TOTAL=1,1,1,10
+        bot._cached_step=1;bot.base_price=100
+        with patch.object(bot,'wait_until_tradable'),patch.object(bot,'get_current_position',return_value=0):
+            bot.set_grid(client,100)
+        orders=client.GetOrders(p['class_code'],p['sec_code'])['data']
+        buy=next(o for o in orders if o['price']==99)
+        sell=next(o for o in orders if o['price']==101)
+        sell.update(flags=6,withdraw_datetime=dict(year=2026,month=10,day=28,hour=23,min=50,sec=0))
+        self.engine.on_event(dict(cmd='OnOrder',data=sell))
+        del self.broker.orders[sell['order_num']]
+        client.RefreshOrders(strict=True)
+        bot.verify_tracked_grid_orders(client)
+        self.assertIsNone(bot.completed_grid_level(client))
+        with patch.object(bot,'get_current_position',return_value=0), \
+             patch.object(bot,'check_quik_connection',return_value=True),patch.object(bot,'check_time',return_value=True), \
+             patch.object(bot,'check_session_status',return_value=True),patch.object(bot,'set_grid') as rebuild:
+            bot.reconcile_grid(client,100,0)
+        rebuild.assert_not_called()
+        active=client.GetOrders(p['class_code'],p['sec_code'])['data']
+        self.assertEqual({o['price'] for o in active},{99,101})
+        self.assertTrue(any(o['order_num']==buy['order_num'] for o in active))
+        self.assertEqual(bot.base_price,100)
+        self.assertEqual([tx['ACTION'] for tx in self.broker.transactions],['NEW_ORDER']*3)
+
+    def test_fresh_quik_order_status_overrides_stale_active_registry_entry(self):
+        client=self.connect()
+        order=self.create_order(client)
+        order['flags']=2
+        self.broker.orders[order['order_num']]=copy.deepcopy(order)
+        client.RefreshOrders()
+        self.assertEqual(client.GetOrders('FUTSPREAD','SPREAD_1')['data'],[])
+        self.assertEqual(self.engine.registry.order(order['order_num'])['flags'],2)
+
+    def test_fresh_quik_active_order_restores_stale_inactive_registry_entry(self):
+        client=self.connect()
+        active=self.create_order(client)
+        inactive=dict(active,flags=2)
+        self.engine.on_event(dict(cmd='OnOrder',data=inactive))
+        self.assertEqual(self.engine.registry.active(profile()),[])
+        self.broker.orders[active['order_num']]=copy.deepcopy(active)
+        client.RefreshOrders()
+        self.assertEqual([o['order_num'] for o in client.GetOrders('FUTSPREAD','SPREAD_1')['data']],
+                         [active['order_num']])
+        self.assertEqual(self.engine.registry.order(active['order_num'])['flags'],active['flags'])
+
+    def test_strict_refresh_blocks_unowned_orders_without_cancelling_them(self):
+        client=self.connect()
+        own=self.create_order(client)
+        p=profile()
+        foreign=dict(order_num=9999,trans_id=7,class_code=p['class_code'],sec_code=p['sec_code'],
+                     account=p['account'],flags=1,price=99,qty=1,balance=1)
+        self.broker.orders[foreign['order_num']]=foreign
+        with self.assertRaisesRegex(RemoteError,'Unowned active orders'):
+            client.RefreshOrders(strict=True)
+        self.assertEqual(len(self.broker.transactions),1)
+        self.assertTrue(self.broker.orders[own['order_num']]['flags'] & 1)
+        self.assertTrue(self.broker.orders[foreign['order_num']]['flags'] & 1)
+        del self.broker.orders[foreign['order_num']]
+        client.RefreshOrders(strict=True)
+
+    def test_strict_refresh_blocks_unresolved_transaction(self):
+        client=self.connect()
+        gid=self.engine.registry.allocate('bot_1','91','NEW_ORDER')
+        self.engine.registry.mark(gid,'uncertain')
+        with self.assertRaises(TransactionUncertain):
+            client.RefreshOrders(strict=True)
+        self.assertEqual(self.broker.transactions,[])
+
     def test_calendar_spread_far_leg_position_through_shared_gateway(self):
         original = self.broker.call
         holdings = []
@@ -862,11 +966,13 @@ class BotTests(unittest.TestCase):
             bot.retry_pending_grid(client)
             client.RefreshOrders.assert_not_called()
             cancel.assert_called_once()
-        client.GetOrders.return_value = {'data': [dict(flags=5, balance=2, price=100+bot.GRID_STEP)]}
+        client.GetOrders.return_value = {'data': [dict(order_num=10, flags=5, balance=2, price=100+bot.GRID_STEP)]}
         client.WaitTransaction.side_effect = None
         client.WaitTransaction.return_value = {'data': {'order_num': 11}}
         with patch.object(bot, 'get_current_position', return_value=0), \
              patch.object(bot, 'get_price_step', return_value=1), patch.object(bot.time, 'monotonic', return_value=161), \
+             patch.object(bot,'check_quik_connection',return_value=True),patch.object(bot,'check_time',return_value=True), \
+             patch.object(bot,'check_session_status',return_value=True), \
              patch.object(bot, 'cancel_all_orders') as cancel:
             bot.retry_pending_grid(client)
             cancel.assert_not_called()
@@ -884,6 +990,39 @@ class BotTests(unittest.TestCase):
             bot.retry_pending_grid(client)
             send.assert_not_called()
             self.assertEqual(len(bot.pending_grid_orders), 1)
+
+    def test_repair_stops_if_tracked_level_fills_between_missing_orders(self):
+        bot=self.bot
+        bot.MAX_LOTS_TOTAL=10
+        bot.pending_grid_orders[:]=[(99,2,'B'),(103,2,'S')]
+        bot.grid_order_numbers.add('101')
+        client=Mock()
+        old=dict(order_num=101,flags=5,price=101,qty=2,balance=2)
+        new=dict(order_num=202,flags=1,price=99,qty=2,balance=2)
+        client.GetOrders.side_effect=[{'data':[old]},{'data':[old]},{'data':[new]}]
+        client.GetOrderByClassNumber.return_value={'data':dict(old,flags=28,balance=0,
+            class_code=bot.CLASS,sec_code=bot.SECCODE,account=bot.ACCOUNT)}
+        client.GetTrades.return_value={'data':[dict(order_num=101,price=101)]}
+        with patch.object(bot,'get_current_position',return_value=0), \
+             patch.object(bot,'check_quik_connection',return_value=True),patch.object(bot,'check_time',return_value=True), \
+             patch.object(bot,'check_session_status',return_value=True), \
+             patch.object(bot,'send_limit_order',return_value={'order_num':202}) as send:
+            bot.retry_pending_grid(client)
+        send.assert_called_once_with(client,99,2,'B')
+        self.assertEqual(bot.pending_grid_orders,[(103,2,'S')])
+
+    def test_repair_does_not_send_when_session_closes_after_snapshot(self):
+        bot=self.bot
+        bot.pending_grid_orders[:]=[(99,2,'B')]
+        client=Mock();client.GetOrders.return_value={'data':[]}
+        with patch.object(bot,'get_current_position',return_value=0), \
+             patch.object(bot,'check_quik_connection',return_value=True),patch.object(bot,'check_time',return_value=True), \
+             patch.object(bot,'check_session_status',return_value=False), \
+             patch.object(bot,'send_limit_order') as send:
+            with self.assertRaisesRegex(RuntimeError,'Торговля недоступна'):
+                bot.retry_pending_grid(client)
+        send.assert_not_called()
+        self.assertEqual(bot.pending_grid_orders,[(99,2,'B')])
 
     def test_position_uses_far_leg_even_when_near_leg_has_opposite_sign(self):
         bot = self.bot
@@ -1036,6 +1175,31 @@ class BotTests(unittest.TestCase):
         with self.assertRaises(TransactionUncertain):
             bot.completed_grid_level(client)
         self.assertEqual(bot.grid_order_numbers,{'101'})
+
+    def test_reconcile_adds_only_levels_allowed_by_position_and_existing_balance(self):
+        bot=self.bot
+        bot.LEVELS,bot.LOT_PER_LEVEL,bot.GRID_STEP,bot.MAX_LOTS_TOTAL=2,2,1,10
+        client=Mock()
+        client.GetOrders.return_value={'data':[dict(order_num=101,flags=1,price=99,qty=2,balance=1)]}
+        with patch.object(bot,'retry_pending_grid') as retry,patch.object(bot,'set_grid') as rebuild:
+            bot.reconcile_grid(client,100,9)
+        rebuild.assert_not_called();retry.assert_called_once_with(client)
+        self.assertEqual({(p,side) for p,_,side in bot.pending_grid_orders},{(101,'S'),(102,'S')})
+        self.assertEqual(bot.grid_order_numbers,{'101'})
+
+    def test_reconcile_rebuilds_wrong_price_but_does_not_assume_invalid_data(self):
+        bot=self.bot
+        bot.LEVELS,bot.LOT_PER_LEVEL,bot.GRID_STEP,bot.MAX_LOTS_TOTAL=1,2,1,10
+        client=Mock()
+        order=dict(order_num=101,flags=1,price=97,qty=2,balance=2)
+        client.GetOrders.return_value={'data':[order]}
+        with patch.object(bot,'set_grid') as rebuild:
+            bot.reconcile_grid(client,100,0)
+        rebuild.assert_called_once_with(client,100)
+        order.pop('balance')
+        with patch.object(bot,'set_grid') as rebuild,self.assertRaises(TransactionUncertain):
+            bot.reconcile_grid(client,100,0)
+        rebuild.assert_not_called()
 
     def test_skipped_position_updates_count_full_level(self):
         bot = self.bot

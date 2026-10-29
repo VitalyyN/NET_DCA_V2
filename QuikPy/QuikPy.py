@@ -117,8 +117,9 @@ class QuikPy:
     def GatewayStatus(self):
         return self.process_request(dict(cmd='GatewayStatus', data='', id=0, t=''))
 
-    def RefreshOrders(self):
-        return self.process_request(dict(cmd='GatewayRefreshOrders', data='', id=0, t=''))
+    def RefreshOrders(self, strict=False):
+        return self.process_request(dict(cmd='GatewayRefreshOrders',
+                                         data={'strict': True} if strict else '', id=0, t=''))
 
     def GetConfirmedUnfilledCancellation(self, order_num):
         return self.process_request(dict(cmd='GatewayConfirmedUnfilledCancellation',

@@ -273,6 +273,23 @@ class StrategyAuditTests(unittest.TestCase):
         self.assertEqual(delays[:2],[3,2])
         self.assertEqual(delays[2:],[1]*28)
 
+    def test_each_pause_reconciles_before_periodic_ten_cycle_check(self):
+        cases = (
+            dict(connections=[True],sessions=[True],times=[True,True,True,False,False,True],
+                 delay=self.bot.STABILIZATION_DELAY_SEC),
+            dict(connections=[True],sessions=[True,True,False,True],times=[True],
+                 delay=self.bot.STABILIZATION_DELAY_SEC),
+            dict(connections=[False,True],sessions=[True],times=[True],
+                 delay=self.bot.RECONNECT_DELAY_SEC),
+        )
+        for case in cases:
+            with self.subTest(case=case):
+                scope,_,delays=self.run_main_loop(connections=case['connections'],
+                    sessions=case['sessions'],times=case['times'],positions=[0],prices=[100],
+                    stop_after=9,keep_orders=True)
+                self.assertIn(case['delay'],delays)
+                self.assertGreaterEqual(scope['qp'].RefreshOrders.call_count,1)
+
 
 class ConnectionAuditTests(unittest.TestCase):
     setUp = fixtures.GatewayTests.setUp
