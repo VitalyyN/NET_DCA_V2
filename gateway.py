@@ -381,6 +381,15 @@ class Engine:
                 raise ValueError('Bot not registered')
             self.refresh(profile)
             return self.registry.active(profile)
+        if cmd == 'GatewayConfirmedUnfilledCancellation':
+            if profile is None:
+                raise ValueError('Bot not registered')
+            if not isinstance(data, str) or not data.isdigit():
+                raise ValueError('Order number must be a decimal string')
+            order = self.registry.confirmed_unfilled_cancellation(profile, data)
+            if order is not None:
+                LOGGER.info('Using saved QUIK unfilled cancellation: bot=%s order=%s', profile['bot_id'], data)
+            return order
         if cmd == 'sendTransaction':
             return self._send(data, profile, request.get('__session_id', ''))
         if cmd not in READ_COMMANDS:

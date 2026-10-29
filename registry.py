@@ -4,6 +4,8 @@ import logging
 import sqlite3
 import threading
 import time
+from datetime import datetime
+from decimal import Decimal, InvalidOperation
 
 from transport import RemoteError, TransactionUncertain
 
@@ -81,6 +83,33 @@ class Registry:
         with self.lock:
             row = self.db.execute('SELECT payload FROM orders WHERE num=?',(str(number),)).fetchone()
             return json.loads(row['payload']) if row else None
+
+    def confirmed_unfilled_cancellation(self, profile, number):
+        """Return only an owned, explicitly cancelled order with no fills."""
+        with self.lock:
+            row = self.db.execute('SELECT * FROM orders WHERE num=? AND bot=? AND active=0',
+                                  (str(number), profile['bot_id'])).fetchone()
+            if row is None:
+                return None
+            try:
+                order = json.loads(row['payload'])
+                if str(order['order_num']) != str(number) or not matches(order, profile):
+                    return None
+                flags = int(order['flags'])
+                qty, balance = Decimal(str(order['qty'])), Decimal(str(order['balance']))
+                if flags & 1 or not flags & 2 or not qty.is_finite() or qty <= 0 or qty != balance:
+                    return None
+                when = order['withdraw_datetime']
+                cancelled = datetime(int(when['year']), int(when['month']), int(when['day']),
+                                     int(when['hour']), int(when['min']), int(when['sec']))
+                if cancelled.year < 2000:
+                    return None
+                tx = self.db.execute("SELECT gid FROM transactions WHERE gid=? AND bot=? "
+                    "AND action='NEW_ORDER' AND state='accepted' AND order_num=?",
+                    (str(order['trans_id']), profile['bot_id'], str(number))).fetchone()
+                return order if tx is not None else None
+            except (KeyError, TypeError, ValueError, OverflowError, InvalidOperation):
+                return None
 
     def missing_orders(self, bot, limit=128):
         """Accepted NEW_ORDER without an observed owned order is not an empty grid."""

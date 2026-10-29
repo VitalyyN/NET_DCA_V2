@@ -120,6 +120,10 @@ class QuikPy:
     def RefreshOrders(self):
         return self.process_request(dict(cmd='GatewayRefreshOrders', data='', id=0, t=''))
 
+    def GetConfirmedUnfilledCancellation(self, order_num):
+        return self.process_request(dict(cmd='GatewayConfirmedUnfilledCancellation',
+                                         data=str(order_num), id=0, t=''))
+
     def WaitTransaction(self, trans_id, timeout=8.0):
         return self.process_request(dict(cmd='GatewayWaitTransaction', data=dict(trans_id=str(trans_id), timeout=timeout), id=0, t=''))
 

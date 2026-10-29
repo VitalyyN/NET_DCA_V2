@@ -224,6 +224,8 @@ def check_position_change_and_update(cur_pos):
 def read_tracked_grid_order(qp, number):
     """Verify a tracked order without changing the grid or its base price."""
     order = qp.GetOrderByClassNumber(CLASS, number)['data']
+    if order is None:
+        order = qp.GetConfirmedUnfilledCancellation(number)['data']
     if not isinstance(order, dict):
         detail = 'QUIK не вернул заявку'
     elif str(order.get('order_num')) != number:

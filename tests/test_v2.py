@@ -248,6 +248,33 @@ class RegistryTests(unittest.TestCase):
             self.registry.wait('bot_1', '9', 0.01)
         self.assertEqual(self.registry.unresolved('bot_1'), 1)
 
+    def test_cached_unfilled_cancellation_requires_exact_terminal_evidence(self):
+        p = profile(); num = '2024401013557188673'
+        gid = self.registry.allocate('bot_1', '2', 'NEW_ORDER')
+        self.registry.on_reply(dict(trans_id=gid, status=3, order_num=int(num)))
+        order = dict(order_num=int(num),trans_id=gid,class_code=p['class_code'],
+                     sec_code=p['sec_code'],account=p['account'],flags=30,qty=1,balance=1,
+                     withdraw_datetime=dict(year=2026,month=10,day=28,hour=23,min=50,sec=0))
+        self.registry.on_order(order, {'bot_1':p})
+        self.assertEqual(self.registry.confirmed_unfilled_cancellation(p,num),order)
+        variants = [dict(order,flags=29),dict(order,flags=28,balance=0),
+                    dict(order,qty=2,balance=1),dict(order,account='OTHER'),
+                    dict(order,sec_code='OTHER'),dict(order,trans_id=gid+1),
+                    dict(order,order_num=int(num)+1),dict(order,withdraw_datetime={}),
+                    dict(order,balance='nan'),dict(order,qty=0,balance=0)]
+        for item in variants:
+            with self.subTest(order=item):
+                self.registry.db.execute('UPDATE orders SET payload=? WHERE num=?', (json.dumps(item),num))
+                self.assertIsNone(self.registry.confirmed_unfilled_cancellation(p,num))
+        self.registry.db.execute('UPDATE orders SET payload=?,active=1 WHERE num=?',(json.dumps(order),num))
+        self.assertIsNone(self.registry.confirmed_unfilled_cancellation(p,num))
+        self.registry.db.execute('UPDATE orders SET active=0 WHERE num=?',(num,))
+        self.registry.db.execute("UPDATE transactions SET state='uncertain' WHERE gid=?",(gid,))
+        self.assertIsNone(self.registry.confirmed_unfilled_cancellation(p,num))
+        self.registry.db.execute("UPDATE transactions SET state='accepted' WHERE gid=?",(gid,))
+        self.registry.db.execute('UPDATE orders SET active=0,bot=? WHERE num=?',('bot_2',num))
+        self.assertIsNone(self.registry.confirmed_unfilled_cancellation(p,num))
+
     def test_broker_status_distinguishes_refusal_from_unknown_outcome(self):
         for status in (12, 15, 99):
             gid = self.registry.allocate('bot_1', str(status), 'NEW_ORDER')
@@ -331,6 +358,26 @@ class GatewayTests(unittest.TestCase):
         client.WaitTransaction(trans_id)
         wait_until(lambda: len(self.engine.registry.active(profile(n))) == 1)
         return self.engine.registry.active(profile(n))[0]
+
+    def test_rollover_uses_owned_unfilled_cancellation_without_trading(self):
+        client = self.connect()
+        p = profile(); num = 2024401013557188673
+        gid = self.engine.registry.allocate('bot_1','88','NEW_ORDER')
+        self.engine.registry.on_reply(dict(trans_id=gid,status=3,order_num=num))
+        order = dict(order_num=num,trans_id=gid,class_code=p['class_code'],sec_code=p['sec_code'],
+            account=p['account'],flags=30,qty=1,balance=1,price=1540,
+            withdraw_datetime=dict(year=2026,month=10,day=28,hour=23,min=50,sec=0))
+        self.engine.registry.on_order(order,{'bot_1':p})
+        self.assertIsNone(client.GetOrderByClassNumber(p['class_code'],str(num))['data'])
+        self.assertEqual(client.GetConfirmedUnfilledCancellation(str(num))['data'],order)
+        spec=importlib.util.spec_from_file_location('grid_rollover',ROOT/'main.py')
+        bot=importlib.util.module_from_spec(spec);spec.loader.exec_module(bot)
+        bot.CLASS,bot.SECCODE,bot.ACCOUNT=p['class_code'],p['sec_code'],p['account']
+        bot.base_price=1400;bot.grid_order_numbers.add(str(num))
+        self.assertIsNone(bot.completed_grid_level(client))
+        self.assertFalse(bot.grid_order_numbers)
+        self.assertEqual(bot.base_price,1400)
+        self.assertEqual(self.broker.transactions,[])
 
     def test_calendar_spread_far_leg_position_through_shared_gateway(self):
         original = self.broker.call
@@ -985,6 +1032,7 @@ class BotTests(unittest.TestCase):
         client = Mock()
         client.GetOrders.return_value = {'data':[]}
         client.GetOrderByClassNumber.return_value = {'data':None}
+        client.GetConfirmedUnfilledCancellation.return_value = {'data':None}
         with self.assertRaises(TransactionUncertain):
             bot.completed_grid_level(client)
         self.assertEqual(bot.grid_order_numbers,{'101'})

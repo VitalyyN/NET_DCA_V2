@@ -80,6 +80,7 @@ class LifecycleTests(unittest.TestCase):
         self.bot.grid_order_numbers.add(number)
         qp.GetOrders.return_value={'data':[]}
         qp.GetTrades.return_value={'data':[]}
+        qp.GetConfirmedUnfilledCancellation.return_value={'data':None}
         valid=dict(order_num=int(number),class_code=self.bot.CLASS,sec_code=self.bot.SECCODE,
                    account=self.bot.ACCOUNT,flags=28,balance=0,price=100)
         qp.GetOrderByClassNumber.side_effect=[{'data':None},{'data':None},{'data':valid},{'data':valid}]
