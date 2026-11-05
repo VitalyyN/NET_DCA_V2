@@ -193,7 +193,7 @@ class StrategyAuditTests(unittest.TestCase):
             'tick':{'param_value':'1'}, 'foreign_active_orders':0,'unresolved_transactions':0}}
         client.GetInfoParam.return_value = {'data':'12:00:00'}
         client.GetOrders.return_value = {'data': []}
-        scope.update(QuikPy=lambda **kw: client, time=types.SimpleNamespace(sleep=sleep),
+        scope.update(QuikPy=lambda **kw: client, time=types.SimpleNamespace(sleep=sleep, monotonic=lambda: sum(delays)),
             GRID_STEP=grid_step, LOT_PER_LEVEL=1, LEVELS=1, POLL_MS=1,
             check_time=sequence(times or [True]), check_quik_connection=sequence(connections),
             check_session_status=sequence(sessions), get_current_position=sequence(positions),
@@ -266,12 +266,12 @@ class StrategyAuditTests(unittest.TestCase):
         self.assertEqual(grids,[100])  # Session is still closed after reconnect.
         self.assertIn(scope['RECONNECT_DELAY_SEC'],delays)
 
-    def test_order_reconciliation_every_ten_active_cycles(self):
+    def test_order_reconciliation_once_per_minute(self):
         scope,grids,delays = self.run_main_loop(connections=[True], sessions=[True],
-            positions=[2],prices=[100],stop_after=30)
+            positions=[2],prices=[100],stop_after=130)
         self.assertEqual(scope['qp'].RefreshOrders.call_count,2)
         self.assertEqual(delays[:2],[3,2])
-        self.assertEqual(delays[2:],[1]*28)
+        self.assertEqual(delays[2:],[1]*128)
 
     def test_each_pause_reconciles_before_periodic_ten_cycle_check(self):
         cases = (

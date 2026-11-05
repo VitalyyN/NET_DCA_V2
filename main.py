@@ -800,7 +800,14 @@ def registration_ready(registration):
         raise RuntimeError(f'Торговля заблокирована: чужих заявок '
                            f'{registration["foreign_active_orders"]}, неопределённых транзакций '
                            f'{registration["unresolved_transactions"]}. '
-                           'Выполняется только сверка; для старой неопределённости — recover_transaction.py.')
+                           'Выполняется сверка; при сохраняющейся неопределённости доступен recover_transaction.py.')
+
+
+def report_old_unknown_reconciliation(registration):
+    ids = registration.get('reconciled_old_unknown', [])
+    if ids:
+        print(f'{datetime.now():%Y-%m-%d %H:%M:%S} Старые транзакции {", ".join(map(str, ids))}: '
+              'активные заявки и позиции QUIK сверены; прежний результат неизвестен и сохранён в истории.')
 
 
 def connect_and_register():
@@ -812,6 +819,7 @@ def connect_and_register():
             ensure_gateway(REQUESTS_PORT, CALLBACKS_PORT)
             client = QuikPy(requests_port=REQUESTS_PORT, callbacks_port=CALLBACKS_PORT)
             registration = client.RegisterBot(BOT_ID, CLASS, SECCODE, BASE_ASSET_CODE, ACCOUNT)['data']
+            report_old_unknown_reconciliation(registration)
             registration_ready(registration)
             if _wait_status.message is not None:
                 print(f'{datetime.now():%Y-%m-%d %H:%M:%S} QUIK готов для {CLASS}/{SECCODE}; продолжаем запуск.')
@@ -850,6 +858,7 @@ def wait_for_runtime_ready(qp, error):
             if not qp.connected:
                 qp.Reconnect()
             registration = qp.RegisterBot(BOT_ID, CLASS, SECCODE, BASE_ASSET_CODE, ACCOUNT)['data']
+            report_old_unknown_reconciliation(registration)
             registration_ready(registration)
             if not check_quik_connection(qp):
                 raise RuntimeError('QUIK не подключён к серверу')
@@ -1004,6 +1013,7 @@ if __name__ == "__main__":
         time_wait = False
         reconciliation_due = False
         cycle_counter = 1  # Счётчик циклов для проверки дублирования заявок
+        last_periodic_order_refresh = time.monotonic()
         waiting_for_price = False
         
         gc_counter = 0  # Счётчик для периодической очистки мусора
@@ -1086,12 +1096,17 @@ if __name__ == "__main__":
                     verify_tracked_grid_orders(qp)
                     reconciliation_due = False
                     orders_reconciled = True
+                    last_periodic_order_refresh = time.monotonic()
 
-                # Сверяем заявки после задержек восстановления и проверки сессии.
+                # Full QUIK table scans are expensive; events update the registry between scans.
+                if time.monotonic() - last_periodic_order_refresh >= 60:
+                    qp.RefreshOrders(strict=True)
+                    last_periodic_order_refresh = time.monotonic()
+                    orders_reconciled = True
+
+                # Duplicate checks continue at their original cadence using the registry.
                 if cycle_counter >= 10:
                     cycle_counter = 0
-                    qp.RefreshOrders(strict=True)
-                    orders_reconciled = True
                     if has_duplicate_orders(qp):
                         print(f"\n{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} Обнаружены дубли заявок или превышение числа уровней. Отменяем все...")
                         cancel_all_orders(qp)

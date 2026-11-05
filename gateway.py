@@ -5,6 +5,7 @@ from collections import deque
 import copy
 import json
 import logging
+import math
 from log_policy import make_handler, cleanup_logs
 from pathlib import Path
 import queue
@@ -16,7 +17,7 @@ import uuid
 import sys
 
 from QuikPy import QuikPy
-from registry import Registry
+from registry import Registry, matches
 from transport import (BridgeDisconnected, JsonLineSocket, RemoteError,
                        TransactionUncertain, close_socket, encode_frame,
                        REQUEST_WAIT_SECONDS, REGISTRATION_WAIT_SECONDS)
@@ -85,6 +86,7 @@ class Engine:
         self.last_log_cleanup = 0
         self.pending_trades = deque(maxlen=256)
         self.event_lock = threading.RLock()
+        self.reconcile_generation = 0
         self.metrics = {'requests': 0, 'events': 0, 'lua': {}}
         self.worker = threading.Thread(target=self._work, name='QUIKRequests', daemon=True)
         self.worker.start()
@@ -176,6 +178,8 @@ class Engine:
 
     def on_event(self, event):
         with self.event_lock:
+            if event.get('cmd') in ('OnOrder', 'OnTrade', 'OnTransReply', 'OnConnected', 'OnDisconnected'):
+                self.reconcile_generation += 1
             self._on_event(event)
             if event['cmd'] in ('OnOrder', 'OnTransReply'):
                 waiting = list(self.pending_trades)
@@ -229,6 +233,78 @@ class Engine:
             future.set_exception(BridgeDisconnected('Upstream request queue is full'))
         return future
 
+    def reconcile_old_unknown_orders(self, profile):
+        """Reconcile old unknown submissions using current QUIK orders and positions."""
+        reconciled = []
+        for row in self.registry.old_unknown_orders(profile['bot_id']):
+            try:
+                request = json.loads(row['request'])
+                if (not isinstance(request, dict) or request.get('ACTION') != 'NEW_ORDER'
+                        or str(request.get('TRANS_ID')) != str(row['gid'])
+                        or request.get('ACCOUNT') != profile['account']
+                        or request.get('TYPE') != 'L' or request.get('OPERATION') not in ('B', 'S')
+                        or int(request['QUANTITY']) <= 0 or not math.isfinite(float(request['PRICE']))
+                        or not isinstance(request.get('CLASSCODE'), str) or not request['CLASSCODE']
+                        or not isinstance(request.get('SECCODE'), str) or not request['SECCODE']):
+                    continue
+            except (KeyError, TypeError, ValueError, OverflowError):
+                continue  # Legacy or malformed intent needs individual reconciliation.
+            if self._call('isConnected')['data'] != 1:
+                return reconciled
+            accounts = self._call('getTradeAccounts')['data']
+            if profile['account'] not in {item.get('trdaccid', item.get('account'))
+                                           for item in accounts if isinstance(item, dict)}:
+                return reconciled
+            target = dict(profile, class_code=request['CLASSCODE'], sec_code=request['SECCODE'])
+            with self.event_lock:
+                generation = self.reconcile_generation
+                with self.registry.lock:
+                    watermark = self.registry.sequence
+            active = self._call('get_active_orders', target)['data']
+            # Never infer ownership from price or volume. Ambiguous active orders block.
+            blocked = False
+            for item in active:
+                if not isinstance(item, dict) or not matches(item, target):
+                    blocked = True
+                    break
+                number = item.get('order_num')
+                trans_id = item.get('trans_id', item.get('trans_id_str'))
+                try:
+                    is_active = bool(int(item['flags']) & 1)
+                except (KeyError, ValueError, TypeError, OverflowError):
+                    is_active = False
+                if (not is_active or not number or str(trans_id) in ('None', '', '0', str(row['gid']))
+                        or self.registry.owner(number) != profile['bot_id']):
+                    blocked = True
+                    break
+            if blocked:
+                continue
+            holdings = self._call('getFuturesClientHoldings')['data']
+            positions = [item for item in holdings if isinstance(item, dict)
+                         and item.get('trdaccid', item.get('account')) == profile['account']]
+            codes = set()
+            try:
+                for item in positions:
+                    code = item.get('sec_code', item.get('seccode'))
+                    value = float(item['totalnet'])
+                    if not code or code in codes or not math.isfinite(value) or value != int(value):
+                        raise ValueError('invalid or ambiguous position')
+                    codes.add(code)
+            except (KeyError, TypeError, ValueError, OverflowError):
+                continue
+            if self._call('isConnected')['data'] != 1:
+                return reconciled
+            evidence = dict(profile=target, active_orders=active, account_positions=positions,
+                            quik_connected=True, outcome='unknown')
+            with self.event_lock:
+                closed = (self.reconcile_generation == generation and
+                          self.registry.close_old_unknown_after_snapshot(row, evidence, watermark))
+            if closed:
+                reconciled.append(row['gid'])
+                LOGGER.warning('Old transaction reconciled from current QUIK snapshot: bot=%s gid=%s; '
+                               'broker outcome remains unknown', profile['bot_id'], row['gid'])
+        return reconciled
+
     def _register(self, profile):
         required = ('bot_id', 'class_code', 'sec_code', 'base_asset_code', 'account')
         if not isinstance(profile, dict) or any(
@@ -244,9 +320,14 @@ class Engine:
                     profile['account'], profile['base_asset_code']):
                 raise ValueError('Bots cannot share the same account and working leg')
         previous = profiles.get(profile['bot_id'])
-        if previous and previous != profile and (
-                self.registry.active(previous) or self.registry.unresolved(profile['bot_id'])):
-            raise ValueError('Cannot change a profile with active orders or unresolved transactions')
+        reconciled = []
+        if previous and previous != profile:
+            if self.registry.active(previous):
+                raise ValueError('Cannot change a profile with active orders or unresolved transactions')
+            if self.registry.unresolved(profile['bot_id']):
+                reconciled.extend(self.reconcile_old_unknown_orders(previous))
+                if self.registry.unresolved(profile['bot_id']):
+                    raise ValueError('Cannot change a profile with active orders or unresolved transactions')
         info = self._call('getSecurityInfo', profile['class_code'] + '|' + profile['sec_code'])['data']
         if not info:
             raise ValueError(f'Instrument not found in QUIK: {profile["class_code"]}/{profile["sec_code"]}. '
@@ -287,10 +368,12 @@ class Engine:
             for transaction in missing:
                 self.verify_order(transaction,profile)
         self.refresh_trades(profile)
+        if self.registry.unresolved(profile['bot_id']):
+            reconciled.extend(self.reconcile_old_unknown_orders(profile))
         return dict(
             foreign_active_orders=len(self.registry.active(profile, owned=False)),
             unresolved_transactions=self.registry.unresolved(profile['bot_id']),
-            instrument=info, working_leg=leg, tick=tick)
+            instrument=info, working_leg=leg, tick=tick, reconciled_old_unknown=reconciled)
 
     def _send(self, transaction, profile, session=""):
         if profile is None or not isinstance(transaction, dict):
@@ -424,7 +507,7 @@ class Engine:
             self.last_log_cleanup = now
         if self.client:
             for profile in self._profiles().values():
-                if now - self.last_snapshot.get(profile['bot_id'], 0) < 10:
+                if now - self.last_snapshot.get(profile['bot_id'], 0) < 60:
                     continue
                 try:
                     self._connect()

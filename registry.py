@@ -4,12 +4,18 @@ import logging
 import sqlite3
 import threading
 import time
-from datetime import datetime
+import hashlib
+import uuid
+from contextlib import closing
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
+from pathlib import Path
 
 from transport import RemoteError, TransactionUncertain
 
 LOGGER = logging.getLogger(__name__)
+MOSCOW = timezone(timedelta(hours=3))
+OLD_UNKNOWN_SECONDS = 24 * 60 * 60
 
 
 def matches(data, profile):
@@ -20,6 +26,7 @@ def matches(data, profile):
 
 class Registry:
     def __init__(self, path):
+        self.path = Path(path).resolve()
         self.db = sqlite3.connect(path, check_same_thread=False)
         self.db.row_factory = sqlite3.Row
         self.lock = threading.RLock()
@@ -217,6 +224,66 @@ class Registry:
     def unresolved(self, bot):
         with self.lock:
             return self.db.execute("SELECT COUNT(*) FROM transactions WHERE bot=? AND state IN ('created','sent','uncertain')", (bot,)).fetchone()[0]
+
+    def old_unknown_orders(self, bot, now=None):
+        """Find only old unconfirmed new orders; newer and other actions still block."""
+        now = time.time() if now is None else now
+        today = datetime.fromtimestamp(now, MOSCOW).date()
+        with self.lock:
+            rows = self.db.execute("SELECT * FROM transactions WHERE bot=? AND action='NEW_ORDER' "
+                "AND state='uncertain' AND order_num IS NULL AND created<=? ORDER BY gid LIMIT 64",
+                (bot, now-OLD_UNKNOWN_SECONDS)).fetchall()
+            return [dict(row) for row in rows
+                    if datetime.fromtimestamp(row['created'], MOSCOW).date() < today]
+
+    def close_old_unknown_after_snapshot(self, original, evidence, watermark, now=None):
+        """Record the user's accepted unknown outcome after a fresh QUIK snapshot."""
+        now = time.time() if now is None else now
+        with self.changed:
+            current = self.transaction(original['gid'])
+            if current is None or dict(current) != original or self.sequence != watermark:
+                return False
+            if (current['state'] != 'uncertain' or current['action'] != 'NEW_ORDER'
+                    or current['order_num'] or now-current['created'] < OLD_UNKNOWN_SECONDS
+                    or datetime.fromtimestamp(current['created'], MOSCOW).date()
+                    >= datetime.fromtimestamp(now, MOSCOW).date()):
+                return False
+            # A saved order is positive evidence; never mask it as unknown.
+            for order_row in self.db.execute('SELECT payload FROM orders'):
+                item = json.loads(order_row['payload'])
+                if str(item.get('trans_id')) == str(current['gid']) or str(item.get('trans_id_str')) == str(current['gid']):
+                    return False
+            folder = self.path.parent / 'recovery'
+            folder.mkdir(parents=True, exist_ok=True)
+            backup = folder / f'gateway_before_auto_{current["gid"]}_{uuid.uuid4().hex}.sqlite3'
+            with closing(sqlite3.connect(backup)) as target:
+                self.db.backup(target)
+            with backup.open('rb') as stream:
+                digest = hashlib.file_digest(stream, 'sha256').hexdigest()
+            try:
+                self.db.execute('BEGIN IMMEDIATE')
+                self.db.execute("""CREATE TABLE IF NOT EXISTS transaction_resolutions (
+                    gid INTEGER PRIMARY KEY, bot TEXT NOT NULL, resolved REAL NOT NULL,
+                    operator TEXT NOT NULL, decision TEXT NOT NULL, reason TEXT NOT NULL,
+                    before_json TEXT NOT NULL, backup TEXT NOT NULL, backup_sha256 TEXT NOT NULL)""")
+                self.db.execute("""CREATE TABLE IF NOT EXISTS transaction_auto_snapshots (
+                    gid INTEGER PRIMARY KEY, evidence_json TEXT NOT NULL)""")
+                self.db.execute('INSERT INTO transaction_resolutions VALUES (?,?,?,?,?,?,?,?,?)',
+                    (current['gid'], current['bot'], now, 'automatic', 'closed_unknown',
+                     'User accepted continuation after QUIK active-order and position reconciliation; outcome unknown',
+                     json.dumps(original, ensure_ascii=False), str(backup), digest))
+                self.db.execute('INSERT INTO transaction_auto_snapshots VALUES (?,?)',
+                    (current['gid'], json.dumps(evidence, ensure_ascii=False)))
+                count = self.db.execute("UPDATE transactions SET state='closed_unknown' "
+                    "WHERE gid=? AND bot=? AND state='uncertain'", (current['gid'], current['bot'])).rowcount
+                if count != 1:
+                    raise ValueError('Transaction changed during automatic reconciliation')
+                self.db.commit()
+                self.changed.notify_all()
+            except BaseException:
+                self.db.rollback()
+                raise
+            return True
 
     def wait(self, bot, client_id, timeout, session=""):
         deadline = time.monotonic() + min(max(float(timeout), 0), 8)
