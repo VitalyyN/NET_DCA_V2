@@ -806,8 +806,14 @@ def registration_ready(registration):
 def report_old_unknown_reconciliation(registration):
     ids = registration.get('reconciled_old_unknown', [])
     if ids:
-        print(f'{datetime.now():%Y-%m-%d %H:%M:%S} Старые транзакции {", ".join(map(str, ids))}: '
+        print(f'{datetime.now():%Y-%m-%d %H:%M:%S} Транзакции {", ".join(map(str, ids))}: '
               'активные заявки и позиции QUIK сверены; прежний результат неизвестен и сохранён в истории.')
+
+
+def reconciliation_retry_delay(error):
+    if isinstance(error, TransactionUncertain) or 'неопределённых транзакций' in str(error):
+        return max(RECONNECT_DELAY_SEC, 60)
+    return RECONNECT_DELAY_SEC
 
 
 def connect_and_register():
@@ -838,10 +844,11 @@ def connect_and_register():
         except Exception as exc:
             if client is not None:
                 client.CloseConnectionAndThread()
+            delay = reconciliation_retry_delay(exc)
             _wait_status.show(f'Ожидание готовности QUIK для {CLASS}/{SECCODE}: {exc}. '
-                              f'Повторная проверка через {RECONNECT_DELAY_SEC} сек. '
+                              f'Повторная проверка через {delay} сек. '
                               'Новые заявки не отправляются. Выход — Ctrl+C.')
-            time.sleep(RECONNECT_DELAY_SEC)
+            time.sleep(delay)
 
 
 def wait_for_runtime_ready(qp, error):
@@ -850,9 +857,10 @@ def wait_for_runtime_ready(qp, error):
     from gateway_control import ensure_gateway
     reason = error
     while True:
+        delay = reconciliation_retry_delay(reason)
         _wait_status.show(f'Работа приостановлена: {reason}. '
-                          f'Повторная сверка через {RECONNECT_DELAY_SEC} сек.; новые заявки заблокированы.')
-        time.sleep(RECONNECT_DELAY_SEC)
+                          f'Повторная сверка через {delay} сек.; новые заявки заблокированы.')
+        time.sleep(delay)
         try:
             ensure_gateway(REQUESTS_PORT, CALLBACKS_PORT)
             if not qp.connected:

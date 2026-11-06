@@ -234,7 +234,7 @@ class Engine:
         return future
 
     def reconcile_old_unknown_orders(self, profile):
-        """Reconcile old unknown submissions using current QUIK orders and positions."""
+        """Reconcile unknown submissions using current QUIK orders and positions."""
         reconciled = []
         for row in self.registry.old_unknown_orders(profile['bot_id']):
             try:
@@ -301,7 +301,7 @@ class Engine:
                           self.registry.close_old_unknown_after_snapshot(row, evidence, watermark))
             if closed:
                 reconciled.append(row['gid'])
-                LOGGER.warning('Old transaction reconciled from current QUIK snapshot: bot=%s gid=%s; '
+                LOGGER.warning('Transaction reconciled from current QUIK snapshot: bot=%s gid=%s; '
                                'broker outcome remains unknown', profile['bot_id'], row['gid'])
         return reconciled
 

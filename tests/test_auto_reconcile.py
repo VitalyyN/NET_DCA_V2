@@ -76,7 +76,7 @@ class AutoReconciliationTests(unittest.TestCase):
             reg.wait('bot_1','45',0,session='old')
 
     def test_fresh_unknown_and_unknown_cancellation_remain_blocked(self):
-        for kwargs in (dict(age=60),dict(action='KILL_ORDER')):
+        for kwargs in (dict(age=10),dict(action='KILL_ORDER')):
             with self.subTest(kwargs=kwargs):
                 gid,p=self.seed(**kwargs)
                 _,result=self.register(p)
@@ -87,6 +87,13 @@ class AutoReconciliationTests(unittest.TestCase):
                 with self.engine.registry.lock:
                     self.engine.registry.db.execute('DELETE FROM transactions WHERE gid=?',(gid,))
                     self.engine.registry.db.commit()
+
+    def test_unknown_from_same_day_resolves_after_one_minute(self):
+        gid, p = self.seed(age=61)
+        _, result = self.register(p)
+        self.assertEqual(result['reconciled_old_unknown'], [gid])
+        self.assertEqual(self.engine.registry.transaction(gid)['state'], 'closed_unknown')
+        self.assertEqual(self.broker.transactions, [])
 
     def test_matching_active_quik_order_is_confirmed_not_closed_as_unknown(self):
         gid,p=self.seed()

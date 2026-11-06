@@ -15,7 +15,7 @@ from transport import RemoteError, TransactionUncertain
 
 LOGGER = logging.getLogger(__name__)
 MOSCOW = timezone(timedelta(hours=3))
-OLD_UNKNOWN_SECONDS = 24 * 60 * 60
+OLD_UNKNOWN_SECONDS = 60
 
 
 def matches(data, profile):
@@ -226,15 +226,13 @@ class Registry:
             return self.db.execute("SELECT COUNT(*) FROM transactions WHERE bot=? AND state IN ('created','sent','uncertain')", (bot,)).fetchone()[0]
 
     def old_unknown_orders(self, bot, now=None):
-        """Find only old unconfirmed new orders; newer and other actions still block."""
+        """Find unconfirmed new orders after the reconciliation interval."""
         now = time.time() if now is None else now
-        today = datetime.fromtimestamp(now, MOSCOW).date()
         with self.lock:
             rows = self.db.execute("SELECT * FROM transactions WHERE bot=? AND action='NEW_ORDER' "
                 "AND state='uncertain' AND order_num IS NULL AND created<=? ORDER BY gid LIMIT 64",
                 (bot, now-OLD_UNKNOWN_SECONDS)).fetchall()
-            return [dict(row) for row in rows
-                    if datetime.fromtimestamp(row['created'], MOSCOW).date() < today]
+            return [dict(row) for row in rows]
 
     def close_old_unknown_after_snapshot(self, original, evidence, watermark, now=None):
         """Record the user's accepted unknown outcome after a fresh QUIK snapshot."""
@@ -244,9 +242,7 @@ class Registry:
             if current is None or dict(current) != original or self.sequence != watermark:
                 return False
             if (current['state'] != 'uncertain' or current['action'] != 'NEW_ORDER'
-                    or current['order_num'] or now-current['created'] < OLD_UNKNOWN_SECONDS
-                    or datetime.fromtimestamp(current['created'], MOSCOW).date()
-                    >= datetime.fromtimestamp(now, MOSCOW).date()):
+                    or current['order_num'] or now-current['created'] < OLD_UNKNOWN_SECONDS):
                 return False
             # A saved order is positive evidence; never mask it as unknown.
             for order_row in self.db.execute('SELECT payload FROM orders'):
