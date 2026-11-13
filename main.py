@@ -653,6 +653,17 @@ def reconcile_grid(qp, price, position_now):
     retry_pending_grid(qp)
 
 
+def recover_interrupted_grid(qp):
+    """Keep valid orders; process a newly observed fill before filling gaps."""
+    global grid_build_in_progress
+    qp.RefreshOrders(strict=True)
+    if completed_grid_level(qp) is not None:
+        return False
+    reconcile_grid(qp, base_price, get_current_position(qp))
+    grid_build_in_progress = False
+    return True
+
+
 def set_grid(qp, price):
     """Выставляет сетку лимитных заявок вокруг заданной цены.
 
@@ -1176,8 +1187,11 @@ if __name__ == "__main__":
                         # else: продолжаем ждать исполнения
                     elif need_grid:
                         if grid_build_in_progress:
-                            set_grid(qp, base_price)
-                            print(f'{datetime.now():%Y-%m-%d %H:%M:%S} Незавершённая сетка восстановлена после сверки.')
+                            if not recover_interrupted_grid(qp):
+                                time.sleep(POLL_MS)
+                                continue
+                            orders_reconciled = False
+                            print(f'{datetime.now():%Y-%m-%d %H:%M:%S} Незавершённая сетка сверена.')
                         if orders_reconciled:
                             reconcile_grid(qp, base_price, cur_pos)
                         else:

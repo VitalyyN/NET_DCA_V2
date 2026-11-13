@@ -1187,6 +1187,43 @@ class BotTests(unittest.TestCase):
         self.assertEqual({(p,side) for p,_,side in bot.pending_grid_orders},{(101,'S'),(102,'S')})
         self.assertEqual(bot.grid_order_numbers,{'101'})
 
+    def test_interrupted_grid_preserves_existing_partially_filled_buy(self):
+        bot = self.bot
+        bot.LEVELS, bot.LOT_PER_LEVEL, bot.GRID_STEP, bot.MAX_LOTS_TOTAL = 1, 2, 70, 15
+        bot.base_price, bot.grid_build_in_progress = 1330, True
+        bot.grid_order_numbers.add('101')
+        client = Mock()
+        client.GetOrders.return_value = {'data': [dict(order_num=101, flags=1, price=1260, qty=2, balance=1)]}
+        with patch.object(bot, 'get_current_position', return_value=3), \
+             patch.object(bot, 'retry_pending_grid') as retry, patch.object(bot, 'set_grid') as rebuild:
+            self.assertTrue(bot.recover_interrupted_grid(client))
+        client.RefreshOrders.assert_called_once_with(strict=True)
+        rebuild.assert_not_called()
+        retry.assert_called_once_with(client)
+        self.assertEqual(bot.pending_grid_orders, [(1400, 2, 'S')])
+        self.assertEqual(bot.grid_order_numbers, {'101'})
+        self.assertFalse(bot.grid_build_in_progress)
+
+    def test_interrupted_grid_defers_rebuild_for_filled_buy_and_updates_base(self):
+        bot = self.bot
+        bot.LOT_PER_LEVEL, bot.MAX_LOTS_TOTAL = 1, 15
+        bot.base_price, bot.prev_position, bot.grid_build_in_progress = 1330, 2, True
+        bot.grid_order_numbers.add('101')
+        client = Mock()
+        client.GetOrders.return_value = {'data': []}
+        client.GetOrderByClassNumber.return_value = {'data': dict(order_num=101,
+            class_code=bot.CLASS, sec_code=bot.SECCODE, account=bot.ACCOUNT,
+            flags=24, balance=0, qty=1, price=1260)}
+        client.GetTrades.return_value = {'data': []}
+        with patch.object(bot, 'set_grid') as rebuild, patch.object(bot, 'write_in_file') as save:
+            self.assertFalse(bot.recover_interrupted_grid(client))
+            self.assertTrue(bot.grid_build_in_progress)
+            filled = bot.completed_grid_level(client)
+            self.assertTrue(bot.check_levels_executed(3, client, filled))
+        rebuild.assert_not_called()
+        save.assert_called_once_with(1260.0)
+        self.assertEqual(bot.base_price, 1260.0)
+
     def test_reconcile_rebuilds_wrong_price_but_does_not_assume_invalid_data(self):
         bot=self.bot
         bot.LEVELS,bot.LOT_PER_LEVEL,bot.GRID_STEP,bot.MAX_LOTS_TOTAL=1,2,1,10
