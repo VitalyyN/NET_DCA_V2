@@ -40,7 +40,7 @@ class StrategyAuditTests(unittest.TestCase):
             with self.assertRaises(KeyboardInterrupt):
                 bot.connect_and_register()
         factory.assert_called_once()
-        sleep.assert_called_once_with(bot.RECONNECT_DELAY_SEC)
+        sleep.assert_called_once_with(max(bot.RECONNECT_DELAY_SEC, 60))
         client.CloseConnectionAndThread.assert_called_once()
         client.SendTransaction.assert_not_called()
 
@@ -175,7 +175,8 @@ class StrategyAuditTests(unittest.TestCase):
                 self.assertEqual(bot.base_price,base)
 
     def run_main_loop(self, *, connections, sessions, positions, prices, stop_after,
-                      saved_base=100, grid_step=20, keep_orders=False, times=None):
+                      saved_base=100, grid_step=20, keep_orders=False, times=None,
+                      set_grid_override=None, runtime_wait_override=None):
         tree = ast.parse((ROOT/'main.py').read_text(encoding='utf-8-sig'))
         scope = dict(vars(self.bot))
         functions = [n for n in tree.body if isinstance(n,ast.FunctionDef)]
@@ -202,11 +203,36 @@ class StrategyAuditTests(unittest.TestCase):
             find_active_orders=lambda qp:[1] if keep_orders and grids else [], wait_until_tradable=lambda qp:None,
             set_grid=lambda qp,price:grids.append(price), cancel_all_orders=Mock(),
             send_limit_order=Mock())
+        if set_grid_override is not None:
+            scope['set_grid'] = set_grid_override
+        if runtime_wait_override is not None:
+            scope['wait_for_runtime_ready'] = runtime_wait_override
         main = next(n for n in tree.body if isinstance(n,ast.If) and
                     ast.unparse(n.test) == "__name__ == '__main__'")
         with contextlib.redirect_stdout(io.StringIO()), patch('gateway_control.ensure_gateway'):
             exec(compile(ast.Module(body=main.body,type_ignores=[]),'<actual v2 loop>','exec'),scope)
         return scope,grids,delays
+
+    def test_initial_grid_failure_reconciles_without_restarting_startup(self):
+        wait = Mock()
+        build = Mock(side_effect=[fixtures.TransactionUncertain({'error': 'unknown'})] + [None] * 10)
+        scope, _, _ = self.run_main_loop(connections=[True], sessions=[True],
+            positions=[0], prices=[100], stop_after=5, keep_orders=True,
+            set_grid_override=build, runtime_wait_override=wait)
+        self.assertEqual(wait.call_count, 1, wait.call_args_list)
+        self.assertGreaterEqual(build.call_count, 2)
+        self.assertEqual(scope['base_price'], 100)
+        scope['qp'].RefreshOrders.assert_called()
+
+    def test_failed_initial_grid_waits_if_price_leaves_channel_during_recovery(self):
+        wait = Mock()
+        build = Mock(side_effect=fixtures.TransactionUncertain({'error': 'unknown'}))
+        scope, _, _ = self.run_main_loop(connections=[True], sessions=[True],
+            positions=[0], prices=[100, 100, 150], stop_after=5, saved_base=None,
+            grid_step=10, set_grid_override=build, runtime_wait_override=wait)
+        self.assertEqual(wait.call_count, 1, wait.call_args_list)
+        self.assertEqual(build.call_count, 1)
+        self.assertEqual(scope['base_price'], 100)
 
     def test_clearing_does_not_bypass_price_return_in_actual_loop(self):
         scope,grids,delays = self.run_main_loop(connections=[True],

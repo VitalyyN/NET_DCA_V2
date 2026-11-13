@@ -1011,15 +1011,21 @@ if __name__ == "__main__":
 
         # Save the anchor before the first send so an early failure cannot reset it.
         write_in_file(base_price)
-        set_grid(qp, base_price)
-        print(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} Сетка выставлена. Базовая цена: {base_price}\n")
-        time.sleep(POLL_MS * 2)
+        initial_reconciliation_due = False
+        try:
+            set_grid(qp, base_price)
+        except Exception as exc:
+            wait_for_runtime_ready(qp, exc)
+            initial_reconciliation_due = True
+        else:
+            print(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} Сетка выставлена. Базовая цена: {base_price}\n")
+            time.sleep(POLL_MS * 2)
 
         # Основной цикл работы робота: следим за временем, состоянием позиций и активными заявками
         in_session_wait = False
         connection_lost = False
         time_wait = False
-        reconciliation_due = False
+        reconciliation_due = initial_reconciliation_due
         cycle_counter = 1  # Счётчик циклов для проверки дублирования заявок
         last_periodic_order_refresh = time.monotonic()
         waiting_for_price = False
